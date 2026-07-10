@@ -1,0 +1,10 @@
+name: tfm_huelladevoz
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - ffmpeg
+  - notebook
+  - ipykernel
+  - pysoundfile
+  - pip

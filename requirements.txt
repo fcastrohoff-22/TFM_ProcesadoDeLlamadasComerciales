@@ -1,0 +1,37 @@
+# ============================================================
+# REQUISITOS DE INSTALACIÓN
+# TFM - PROCESAMIENTO DE AUDIO Y DIARIZACIÓN
+# ============================================================
+
+# Dependencias generales del entorno
+ipykernel
+ipywidgets
+
+# ============================================================
+# NOTEBOOK 00 - EDA Y PREPARACIÓN DE DATOS
+# 00_EDA_PreparacionDatos.ipynb
+# ============================================================
+
+google-cloud-storage
+google-cloud-bigquery
+google-cloud-bigquery-storage
+pyarrow
+db-dtypes
+
+pandas
+numpy
+matplotlib
+openpyxl
+
+librosa
+soundfile
+torch
+pyannote.audio
+
+# ============================================================
+# NOTEBOOK 01 - DIARIZACIÓN DE LOCUTORES
+# 01_diarizacion_locutores.ipynb
+# Nuevas dependencias respecto al Notebook 00
+# ============================================================
+
+torchaudio
