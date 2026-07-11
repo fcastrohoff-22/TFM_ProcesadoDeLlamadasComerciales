@@ -21,12 +21,9 @@ db-dtypes
 pandas
 numpy
 matplotlib
-openpyxl
 
 librosa
 soundfile
-torch
-pyannote.audio
 
 # ============================================================
 # NOTEBOOK 01 - DIARIZACIÓN DE LOCUTORES
@@ -35,3 +32,6 @@ pyannote.audio
 # ============================================================
 
 torchaudio
+torch
+pyannote.audio
+openpyxl
