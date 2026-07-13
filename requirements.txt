@@ -6,6 +6,7 @@
 # Dependencias generales del entorno
 ipykernel
 ipywidgets
+python-dotenv
 
 # ============================================================
 # NOTEBOOK 00 - EDA Y PREPARACIÓN DE DATOS

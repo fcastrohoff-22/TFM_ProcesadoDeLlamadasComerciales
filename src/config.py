@@ -2,7 +2,7 @@
 
 import os
 from pathlib import Path
-
+from dotenv import load_dotenv # type: ignore
 
 # ============================================================
 # CONFIGURACIÓN GENERAL
@@ -10,6 +10,9 @@ from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_DIR / "data"
+
+load_dotenv(PROJECT_DIR / ".env")
+HF_TOKEN = os.environ.get("HF_TOKEN")
 
 GCS_AUDIO_SOURCES = {
     "raw": "gs://catedras_audio_detection/pipelineA/raw/",
@@ -74,3 +77,50 @@ def ensure_phase00_directories() -> None:
     EDA_DIR.mkdir(parents=True, exist_ok=True)
     CLEAN_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# ============================================================
+# CONFIGURACIÓN FASE 01
+# ============================================================
+
+GCS_CLEAN_AUDIO_PREFIX = GCS_UNAV_CLEAN_AUDIO_PREFIX
+GCS_DIARIZATION_OUTPUT_PREFIX = GCS_UNAV_ROOT + "diarization_outputs/"
+
+INPUT_DIR = DATA_DIR / "diarization_input_clean_audios"
+OUTPUT_DIR = DATA_DIR / "diarization_outputs"
+
+# Salidas consolidadas de diarización
+DIARIZATION_SUMMARY_CSV = OUTPUT_DIR / "diarization_summary.csv"
+DIARIZATION_ALL_REGULAR_SEGMENTS_CSV = OUTPUT_DIR / "diarization_all_regular_segments.csv"
+DIARIZATION_ALL_SCORED_SEGMENTS_CSV = OUTPUT_DIR / "diarization_all_scored_segments.csv"
+DIARIZATION_ALL_VALID_SEGMENTS_CSV = OUTPUT_DIR / "diarization_all_valid_segments.csv"
+DIARIZATION_ALL_ANCHOR_SEGMENTS_CSV = OUTPUT_DIR / "diarization_all_anchor_segments.csv"
+DIARIZATION_ERRORS_CSV = OUTPUT_DIR / "diarization_errors.csv"
+
+
+def ensure_phase01_directories() -> None:
+    """Crea las carpetas locales necesarias para la fase 01."""
+    INPUT_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# CONFIGURACIÓN DE REETIQUETADO Y EMBEDDINGS
+
+FINAL_RELABEL_DIR = OUTPUT_DIR / "final_relabel"
+
+EMBEDDING_VECTOR_CSV_DIR = FINAL_RELABEL_DIR / "embedding_vectors_csv"
+RELABEL_SUMMARY_CSV = FINAL_RELABEL_DIR / "relabel_summary.csv"
+ALL_FINAL_SEGMENTS_CSV = FINAL_RELABEL_DIR / "all_final_segments.csv"
+ALL_FINAL_MERGED_SEGMENTS_CSV = FINAL_RELABEL_DIR / "all_final_merged_segments.csv"
+ALL_ANCHOR_EMBEDDINGS_CSV = FINAL_RELABEL_DIR / "all_anchor_embeddings.csv"
+ALL_CHANGED_SEGMENTS_CSV = FINAL_RELABEL_DIR / "all_changed_segments.csv"
+RELABELING_SUMMARY_BY_AUDIO_CSV = FINAL_RELABEL_DIR / "relabeling_summary_by_audio.csv"
+ALL_ANCHOR_EMBEDDING_VECTORS_CSV = EMBEDDING_VECTOR_CSV_DIR / "all_anchor_embeddings_vectors.csv"
+ALL_SEGMENT_EMBEDDING_VECTORS_CSV = EMBEDDING_VECTOR_CSV_DIR / "all_segment_embeddings_vectors.csv"
+
+SAVE_EMBEDDING_VECTOR_CSVS = True
+EMBEDDING_MODEL_ID = "pyannote/wespeaker-voxceleb-resnet34-LM"
+EMBEDDING_SAMPLE_RATE = 16000
+RELABEL_MIN_MARGIN = 0.01
+
+def ensure_relabel_directories() -> None:
+    """Crea las carpetas necesarias para reetiquetado y embeddings."""
+    FINAL_RELABEL_DIR.mkdir(parents=True, exist_ok=True)
+    EMBEDDING_VECTOR_CSV_DIR.mkdir(parents=True, exist_ok=True)
