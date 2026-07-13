@@ -1,14 +1,16 @@
-"""Funciones auxiliares para diarización, filtrado, exportación y checkpoints."""
+"""Funciones de diarización, filtrado, selección de anchors y consolidación.
 
-import base64
-import hashlib
+Las utilidades de CSV viven en ``src.io_utils`` y todo el transporte de
+archivos hacia GCS vive en ``src.storage_io``. Este módulo se centra en la
+lógica de diarización propiamente dicha.
+"""
+
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
-import soundfile as sf
-import torch
-from pandas.errors import EmptyDataError
+import numpy as np  # type: ignore
+import pandas as pd  # type: ignore
+import soundfile as sf  # type: ignore
+import torch  # type: ignore
 
 from src.config import (
     OUTPUT_DIR,
@@ -18,7 +20,17 @@ from src.config import (
     DIARIZATION_ALL_SCORED_SEGMENTS_CSV,
     DIARIZATION_ALL_VALID_SEGMENTS_CSV,
     DIARIZATION_ALL_ANCHOR_SEGMENTS_CSV,
-    split_gcs_uri,
+)
+
+from src.io_utils import (
+    write_csv_atomic,
+    read_csv_robust,
+    csv_is_usable,
+)
+
+from src.storage_io import (
+    upload_file,
+    download_file_if_exists,
 )
 
 
@@ -491,61 +503,9 @@ def diarize_audio(
         "audio_mono": audio_mono,
     }
 
-
 # ============================================================
 # GUARDADO DE RESULTADOS POR AUDIO
 # ============================================================
-
-
-def write_csv_atomic(
-    df: pd.DataFrame,
-    path: Path,
-    columns=None,
-):
-    """
-    Escribe un CSV de forma segura.
-
-    Mantiene el encabezado aunque no haya filas y escribe primero
-    en un archivo temporal antes de reemplazar el archivo final.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    df_to_write = (
-        df.copy()
-        if df is not None
-        else pd.DataFrame()
-    )
-
-    if columns is not None:
-        for column in columns:
-            if column not in df_to_write.columns:
-                df_to_write[column] = pd.Series(
-                    dtype="object"
-                )
-
-        extra_columns = [
-            column
-            for column in df_to_write.columns
-            if column not in columns
-        ]
-
-        df_to_write = df_to_write[
-            columns + extra_columns
-        ]
-
-    temporary_path = path.with_suffix(
-        path.suffix + ".tmp"
-    )
-
-    df_to_write.to_csv(
-        temporary_path,
-        index=False,
-    )
-
-    temporary_path.replace(path)
-
-    return path
-
 
 def save_diarization_outputs(
     audio_path: Path,
@@ -607,80 +567,8 @@ def save_diarization_outputs(
     )
 
 # ============================================================
-# CHECKPOINTS Y REANUDACIÓN EN GCS
+# RUTAS Y VALIDEZ DE OUTPUTS POR AUDIO
 # ============================================================
-
-
-def gcs_blob_for_local_path(
-    local_path: Path,
-    gcs_client,
-    gcs_prefix: str = GCS_DIARIZATION_OUTPUT_PREFIX,
-    output_dir: Path = OUTPUT_DIR,
-):
-    bucket_name, prefix = split_gcs_uri(gcs_prefix)
-    relative_path = local_path.relative_to(output_dir).as_posix()
-    blob_path = f"{prefix}{relative_path}"
-    bucket_obj = gcs_client.bucket(bucket_name)
-
-    return bucket_obj.blob(blob_path), bucket_name, blob_path
-
-
-def upload_file_to_gcs(
-    local_path: Path,
-    gcs_client,
-    gcs_prefix: str = GCS_DIARIZATION_OUTPUT_PREFIX,
-    output_dir: Path = OUTPUT_DIR,
-):
-    if not local_path.exists() or local_path.stat().st_size == 0:
-        return False
-
-    blob, _, _ = gcs_blob_for_local_path(
-        local_path,
-        gcs_client,
-        gcs_prefix=gcs_prefix,
-        output_dir=output_dir,
-    )
-    blob.upload_from_filename(str(local_path))
-
-    return True
-
-
-def download_file_from_gcs_if_exists(
-    local_path: Path,
-    gcs_client,
-    gcs_prefix: str = GCS_DIARIZATION_OUTPUT_PREFIX,
-    output_dir: Path = OUTPUT_DIR,
-):
-    blob, _, _ = gcs_blob_for_local_path(
-        local_path,
-        gcs_client,
-        gcs_prefix=gcs_prefix,
-        output_dir=output_dir,
-    )
-
-    if blob.exists():
-        # No se descargan blobs vacíos porque son checkpoints corruptos.
-        if getattr(blob, "size", None) == 0:
-            return False
-
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = local_path.with_suffix(
-            local_path.suffix + ".download"
-        )
-        blob.download_to_filename(str(temporary_path))
-
-        if (
-            temporary_path.exists()
-            and temporary_path.stat().st_size > 0
-        ):
-            temporary_path.replace(local_path)
-            return True
-
-        if temporary_path.exists():
-            temporary_path.unlink()
-
-    return False
-
 
 def get_audio_output_paths(
     audio_path: Path,
@@ -704,60 +592,6 @@ def get_audio_output_paths(
         "anchors": output_dir / f"{stem}_anchors.csv",
         "rttm": output_dir / f"{stem}.rttm",
     }
-
-
-def read_csv_robust(
-    path: Path,
-    columns=None,
-):
-    """
-    Lee un CSV de forma tolerante.
-
-    Si no existe, tiene cero bytes o no puede leerse, devuelve
-    un DataFrame vacío con las columnas esperadas.
-    """
-    if columns is None:
-        columns = []
-
-    if not path.exists() or path.stat().st_size == 0:
-        return pd.DataFrame(columns=columns)
-
-    try:
-        return pd.read_csv(path)
-    except EmptyDataError:
-        return pd.DataFrame(columns=columns)
-    except Exception as error:
-        print(
-            f"Advertencia: no se pudo leer "
-            f"{path.name}: {error}"
-        )
-        return pd.DataFrame(columns=columns)
-
-
-def csv_is_usable(
-    path: Path,
-    required_columns=None,
-):
-    """
-    Un CSV con cero filas es válido si contiene encabezado.
-    Un CSV de cero bytes no se considera válido.
-    """
-    if required_columns is None:
-        required_columns = []
-
-    if not path.exists() or path.stat().st_size == 0:
-        return False
-
-    try:
-        dataframe_header = pd.read_csv(path, nrows=0)
-    except Exception:
-        return False
-
-    return all(
-        column in dataframe_header.columns
-        for column in required_columns
-    )
-
 
 def required_outputs_exist(paths: dict):
     """Comprueba que todos los outputs necesarios sean legibles."""
@@ -795,21 +629,27 @@ def remove_bad_audio_outputs(paths: dict):
                 pass
 
 
+# ============================================================
+# CHECKPOINTS Y REANUDACIÓN POR AUDIO
+# ============================================================
+
+
 def try_restore_audio_outputs_from_gcs(
     paths: dict,
     gcs_client,
     gcs_prefix: str = GCS_DIARIZATION_OUTPUT_PREFIX,
     output_dir: Path = OUTPUT_DIR,
 ):
+    """Restaura desde GCS los outputs de un audio que falten localmente."""
     restored_any = False
 
     for local_path in paths.values():
         if not local_path.exists() or local_path.stat().st_size == 0:
-            restored = download_file_from_gcs_if_exists(
+            restored = download_file_if_exists(
                 local_path,
                 gcs_client,
                 gcs_prefix=gcs_prefix,
-                output_dir=output_dir,
+                base_dir=output_dir,
             )
             restored_any = restored or restored_any
 
@@ -822,242 +662,14 @@ def upload_audio_outputs_to_gcs(
     gcs_prefix: str = GCS_DIARIZATION_OUTPUT_PREFIX,
     output_dir: Path = OUTPUT_DIR,
 ):
+    """Sube a GCS todos los outputs de un audio."""
     for local_path in paths.values():
-        upload_file_to_gcs(
+        upload_file(
             local_path,
             gcs_client,
             gcs_prefix=gcs_prefix,
-            output_dir=output_dir,
+            base_dir=output_dir,
         )
-
-def _file_md5_base64(file_path: Path):
-    """Calcula el MD5 local en el formato utilizado por GCS."""
-    digest = hashlib.md5()
-
-    with file_path.open("rb") as file:
-        for chunk in iter(
-            lambda: file.read(1024 * 1024),
-            b"",
-        ):
-            digest.update(chunk)
-
-    return base64.b64encode(
-        digest.digest()
-    ).decode("ascii")
-
-
-def download_directory_from_gcs(
-    local_dir: Path,
-    gcs_prefix: str,
-    gcs_client,
-    output_dir: Path = OUTPUT_DIR,
-    clear_output_fn=None,
-):
-    """
-    Restaura desde GCS una subcarpeta de OUTPUT_DIR.
-
-    Conserva exactamente la misma estructura de carpetas y nombres.
-    Los archivos locales idénticos no se descargan de nuevo.
-    """
-    bucket_name, prefix = split_gcs_uri(gcs_prefix)
-
-    relative_dir = (
-        local_dir
-        .relative_to(output_dir)
-        .as_posix()
-        .strip("/")
-    )
-
-    remote_prefix = (
-        f"{prefix}{relative_dir}/"
-        if relative_dir
-        else prefix
-    )
-
-    blobs = [
-        blob
-        for blob in gcs_client.list_blobs(
-            bucket_name,
-            prefix=remote_prefix,
-        )
-        if (
-            not blob.name.endswith("/")
-            and getattr(blob, "size", 0)
-        )
-    ]
-
-    restored = 0
-    skipped = 0
-    total_files = len(blobs)
-
-    for index, blob in enumerate(blobs, start=1):
-        relative_path = blob.name[len(prefix):]
-        local_path = output_dir / relative_path
-
-        local_is_current = False
-
-        if (
-            local_path.exists()
-            and local_path.stat().st_size == blob.size
-        ):
-            if blob.md5_hash:
-                local_is_current = (
-                    _file_md5_base64(local_path)
-                    == blob.md5_hash
-                )
-            else:
-                local_is_current = True
-
-        if local_is_current:
-            skipped += 1
-            continue
-
-        if clear_output_fn is not None:
-            clear_output_fn(wait=True)
-
-        print(
-            f"Restaurando outputs "
-            f"{index}/{total_files}: {relative_path}"
-        )
-
-        local_path.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        temporary_path = local_path.with_name(
-            local_path.name + ".download"
-        )
-
-        blob.download_to_filename(
-            str(temporary_path)
-        )
-
-        if (
-            temporary_path.exists()
-            and temporary_path.stat().st_size > 0
-        ):
-            temporary_path.replace(local_path)
-            restored += 1
-        elif temporary_path.exists():
-            temporary_path.unlink()
-
-    if clear_output_fn is not None:
-        clear_output_fn(wait=True)
-
-    print("Restauración desde GCS completada.")
-    print("Archivos encontrados:", total_files)
-    print("Archivos descargados:", restored)
-    print("Archivos locales ya vigentes:", skipped)
-
-    return {
-        "found": total_files,
-        "downloaded": restored,
-        "skipped": skipped,
-    }
-
-
-def upload_directory_to_gcs(
-    local_dir: Path,
-    gcs_prefix: str,
-    gcs_client,
-    clear_output_fn=None,
-    skip_unchanged: bool = True,
-):
-    """
-    Sube recursivamente una carpeta local a GCS.
-
-    Cuando skip_unchanged=True, no vuelve a subir los archivos
-    que ya existen en GCS con el mismo tamaño y checksum.
-    """
-    bucket_name, prefix = split_gcs_uri(gcs_prefix)
-    bucket = gcs_client.bucket(bucket_name)
-
-    files_to_upload = sorted(
-        path
-        for path in local_dir.rglob("*")
-        if path.is_file()
-    )
-
-    remote_blobs = {
-        blob.name: blob
-        for blob in gcs_client.list_blobs(
-            bucket_name,
-            prefix=prefix,
-        )
-        if not blob.name.endswith("/")
-    }
-
-    total_files = len(files_to_upload)
-    uploaded = 0
-    skipped = 0
-
-    for index, local_path in enumerate(
-        files_to_upload,
-        start=1,
-    ):
-        relative_path = (
-            local_path
-            .relative_to(local_dir)
-            .as_posix()
-        )
-
-        blob_path = f"{prefix}{relative_path}"
-        remote_blob = remote_blobs.get(blob_path)
-
-        unchanged = False
-
-        if (
-            skip_unchanged
-            and remote_blob is not None
-            and remote_blob.size
-            == local_path.stat().st_size
-        ):
-            if remote_blob.md5_hash:
-                unchanged = (
-                    _file_md5_base64(local_path)
-                    == remote_blob.md5_hash
-                )
-            else:
-                unchanged = True
-
-        if unchanged:
-            skipped += 1
-            continue
-
-        if clear_output_fn is not None:
-            clear_output_fn(wait=True)
-
-        print(
-            f"Subiendo outputs "
-            f"{index}/{total_files}: {relative_path}"
-        )
-
-        bucket.blob(blob_path).upload_from_filename(
-            str(local_path)
-        )
-
-        uploaded += 1
-
-    if clear_output_fn is not None:
-        clear_output_fn(wait=True)
-
-    print("Subida final completada.")
-    print("Archivos locales revisados:", total_files)
-    print("Archivos subidos:", uploaded)
-    print("Archivos omitidos sin cambios:", skipped)
-    print("Destino:", gcs_prefix)
-
-    return {
-        "total": total_files,
-        "uploaded": uploaded,
-        "skipped": skipped,
-    }
-
-
-# ============================================================
-# CONSOLIDACIÓN DE RESULTADOS
-# ============================================================
 
 
 def build_summary_row_from_outputs(
@@ -1248,11 +860,11 @@ def rebuild_consolidated_outputs(
         all_valid_segments_csv,
         all_anchor_segments_csv,
     ]:
-        upload_file_to_gcs(
+        upload_file(
             path,
             gcs_client,
             gcs_prefix=gcs_prefix,
-            output_dir=output_dir,
+            base_dir=output_dir,
         )
 
     return (
@@ -1262,3 +874,4 @@ def rebuild_consolidated_outputs(
         df_all_valid_local,
         df_all_anchor_local,
     )
+

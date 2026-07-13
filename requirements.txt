@@ -22,9 +22,12 @@ db-dtypes
 pandas
 numpy
 matplotlib
+openpyxl
 
 librosa
 soundfile
+torch
+pyannote.audio
 
 # ============================================================
 # NOTEBOOK 01 - DIARIZACIÓN DE LOCUTORES
@@ -33,6 +36,42 @@ soundfile
 # ============================================================
 
 torchaudio
-torch
-pyannote.audio
-openpyxl
+
+# ============================================================
+# NOTEBOOK 03 - EVALUACIÓN INTERNA DE DIARIZACIÓN Y RELABELING
+# Nuevas dependencias respecto a fases anteriores
+# ============================================================
+
+scikit-learn
+
+# ============================================================
+# NOTEBOOK 05 - TRANSCRIPCIÓN CONTEXTUAL (WHISPER)
+# 05_transcripcion_contextual.ipynb
+# ============================================================
+
+faster-whisper
+
+# ============================================================
+# NOTEBOOK 07 - ANÁLISIS DE SENTIMIENTO / AFECTO
+# 07 (07A texto, 07B audio, 07C fusión)
+# Modelos Hugging Face de sentimiento textual y reconocimiento de emoción
+# ============================================================
+
+transformers
+tqdm
+scipy
+
+# ============================================================
+# NOTEBOOKS 06 / 08 / 09
+# No añaden dependencias nuevas:
+#   06 usa google-cloud-bigquery + scikit-learn (ya listados)
+#   08 usa pandas / numpy (ya listados)
+#   09 usa scikit-learn / torch (ya listados)
+# ============================================================
+
+# ============================================================
+# NOTEBOOKS 10 / 11 - DEMOS
+# ============================================================
+
+panel>=1.4,<2
+plotly>5.20,<7

@@ -27,6 +27,9 @@ from src.diarizacion import (
     SCORED_SEGMENT_COLUMNS,
     ANCHOR_SEGMENT_COLUMNS,
     load_audio_as_mono,
+)
+
+from src.io_utils import (
     read_csv_robust,
     csv_is_usable,
     write_csv_atomic,
@@ -940,14 +943,17 @@ def _attach_segment_id_from_raw(
     )
 
 
-def build_validation_table(
+def validation_input_paths(
     audio_name: str,
     output_dir: Path = OUTPUT_DIR,
     final_relabel_dir: Path = FINAL_RELABEL_DIR,
 ):
     """
-    Construye la tabla maestra de validación de un audio
-    usando exclusivamente los CSV ya existentes.
+    Devuelve las rutas de los CSV necesarios para la tabla de validación.
+
+    Es la única fuente de verdad de qué archivos se requieren, para que
+    tanto ``validation_inputs_exist`` como ``build_validation_table``
+    (y el notebook) trabajen sobre la misma lista.
     """
     audio_name = str(audio_name).strip()
 
@@ -958,19 +964,72 @@ def build_validation_table(
         audio_stem = audio_name
         audio_file = f"{audio_stem}.wav"
 
-    raw_csv_path = output_dir / f"{audio_stem}_raw.csv"
-    valid_csv_path = output_dir / f"{audio_stem}.csv"
-    anchors_csv_path = output_dir / f"{audio_stem}_anchors.csv"
+    return {
+        "audio_stem": audio_stem,
+        "audio_file": audio_file,
+        "raw": output_dir / f"{audio_stem}_raw.csv",
+        "valid": output_dir / f"{audio_stem}.csv",
+        "anchors": output_dir / f"{audio_stem}_anchors.csv",
+        "final_segments": (
+            final_relabel_dir / f"{audio_stem}_final_segments.csv"
+        ),
+        "final_merged": (
+            final_relabel_dir / f"{audio_stem}_final_merged.csv"
+        ),
+        "changed": (
+            final_relabel_dir / f"{audio_stem}_changed_segments.csv"
+        ),
+    }
 
-    final_segments_csv_path = (
-        final_relabel_dir / f"{audio_stem}_final_segments.csv"
+
+def validation_inputs_exist(
+    audio_name: str,
+    output_dir: Path = OUTPUT_DIR,
+    final_relabel_dir: Path = FINAL_RELABEL_DIR,
+):
+    """Indica si existen todos los CSV necesarios para la tabla maestra."""
+    paths = validation_input_paths(
+        audio_name,
+        output_dir=output_dir,
+        final_relabel_dir=final_relabel_dir,
     )
-    final_merged_csv_path = (
-        final_relabel_dir / f"{audio_stem}_final_merged.csv"
+
+    csv_keys = [
+        "raw",
+        "valid",
+        "anchors",
+        "final_segments",
+        "final_merged",
+        "changed",
+    ]
+
+    return all(paths[key].exists() for key in csv_keys)
+
+
+def build_validation_table(
+    audio_name: str,
+    output_dir: Path = OUTPUT_DIR,
+    final_relabel_dir: Path = FINAL_RELABEL_DIR,
+):
+    """
+    Construye la tabla maestra de validación de un audio
+    usando exclusivamente los CSV ya existentes.
+    """
+    input_paths = validation_input_paths(
+        audio_name,
+        output_dir=output_dir,
+        final_relabel_dir=final_relabel_dir,
     )
-    changed_csv_path = (
-        final_relabel_dir / f"{audio_stem}_changed_segments.csv"
-    )
+
+    audio_stem = input_paths["audio_stem"]
+    audio_file = input_paths["audio_file"]
+
+    raw_csv_path = input_paths["raw"]
+    valid_csv_path = input_paths["valid"]
+    anchors_csv_path = input_paths["anchors"]
+    final_segments_csv_path = input_paths["final_segments"]
+    final_merged_csv_path = input_paths["final_merged"]
+    changed_csv_path = input_paths["changed"]
 
     required_paths = [
         raw_csv_path,

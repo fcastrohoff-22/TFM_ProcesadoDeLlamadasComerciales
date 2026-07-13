@@ -6,5 +6,5 @@ dependencies:
   - ffmpeg
   - notebook
   - ipykernel
-  - libsndfile
+  - pysoundfile
   - pip
