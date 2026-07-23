@@ -2617,6 +2617,82 @@ def selected_index_row(audio_stem):
     return rows.iloc[0] if len(rows) else pd.Series(dtype=object)
 
 
+def _select_default_open_set_unknown_audio_stem():
+    """
+    Elige un audio_stem que participó como consulta "unknown" (fuera del
+    conjunto de identidades registradas) en la evaluación open-set del
+    Notebook 09, para que la demo arranque mostrando un caso de rechazo
+    correcto en vez de un audio arbitrario.
+
+    Cruce: voiceprint_identity_split.csv (columna "split", identidades
+    marcadas como fuera del conjunto conocido) -> open_set_identification
+    _predictions.csv (columna "audio_key", la consulta real de ese audio)
+    -> RELABEL_INDEX (para asegurar que el audio_stem es una opción válida
+    del selector).
+
+    El emparejamiento entre "audio_key" y el "audio_stem" del selector usa
+    ``audio_key_variants`` (la misma función que usa el resto del demo al
+    filtrar por audio, vía ``same_audio``/``filter_any_audio_column``), para
+    que el resultado sea exactamente el mismo audio que luego encontrará
+    ``load_voiceprint_outputs`` al renderizar la pestaña 09. Una comparación
+    estricta aquí podía dar un falso "no coincide" y caer al primer audio de
+    la lista, que no tenía por qué estar en el conjunto "unknown".
+
+    Devuelve (audio_stem, reason) o (None, motivo) si no se pudo determinar.
+    """
+    split_df = read_csv_cached(str(VOICEPRINT_DIR / "voiceprint_identity_split.csv"))
+    predictions_df = read_csv_cached(str(VOICEPRINT_DIR / "open_set_identification_predictions.csv"))
+
+    if split_df.empty or "split" not in split_df.columns or "person_id" not in split_df.columns:
+        return None, "no hay voiceprint_identity_split.csv con columnas split/person_id"
+    if predictions_df.empty:
+        return None, "no hay open_set_identification_predictions.csv"
+    if RELABEL_INDEX.empty:
+        return None, "el índice del selector está vacío"
+
+    unknown_mask = split_df["split"].astype(str).str.contains("unknown", case=False, na=False)
+    unknown_person_ids = set(split_df.loc[unknown_mask, "person_id"].astype(str))
+    if not unknown_person_ids:
+        return None, "no se encontraron identidades marcadas 'unknown' en identity_split"
+
+    true_id_col = next(
+        (c for c in ["true_person_id", "true_source_identity_id"] if c in predictions_df.columns),
+        None,
+    )
+    audio_col = next((c for c in ["audio_key", "audio_stem", "audio_file"] if c in predictions_df.columns), None)
+    if true_id_col is None or audio_col is None:
+        return None, "predictions no tiene columnas de identidad/audio esperadas"
+
+    candidates = predictions_df[predictions_df[true_id_col].astype(str).isin(unknown_person_ids)].copy()
+    if candidates.empty:
+        return None, "ninguna consulta open-set corresponde a una identidad 'unknown'"
+
+    # Preferir un caso donde el sistema rechazó correctamente (buen ejemplo
+    # para la demo); si no hay esa columna, se toma cualquier candidato.
+    if "identification_correct" in candidates.columns:
+        correct = candidates[candidates["identification_correct"].astype(str).str.lower().isin(["true", "1"])]
+        if not correct.empty:
+            candidates = correct
+    elif "decision" in candidates.columns:
+        rejected = candidates[candidates["decision"].astype(str).str.contains("unknown|reject", case=False, na=False)]
+        if not rejected.empty:
+            candidates = rejected
+
+    # Índice inverso variante->audio_stem canónico, construido con la MISMA
+    # función de variantes que usa same_audio() en el resto del módulo.
+    variant_to_stem = {}
+    for stem in RELABEL_INDEX["audio_stem"]:
+        for variant in audio_key_variants(stem):
+            variant_to_stem.setdefault(variant, stem)
+
+    for raw_value in candidates[audio_col]:
+        for variant in audio_key_variants(raw_value):
+            if variant in variant_to_stem:
+                return variant_to_stem[variant], "consulta open-set 'unknown' encontrada"
+
+    return None, "los audios candidatos no coinciden con ningún audio_stem del índice (revisar formato de 'audio_key')"
+
+
 def _render_demo_selector():
     """Construye el mismo selector interactivo del Notebook 10 original."""
     options = dropdown_options()
@@ -2648,8 +2724,28 @@ def _render_demo_selector():
             "dashboard_handle": None,
         }
 
+    dropdown_values = {value for _, value in options}
+    default_stem, default_reason = _select_default_open_set_unknown_audio_stem()
+    if default_stem is not None and default_stem in dropdown_values:
+        initial_value = default_stem
+        auto_load_note = (
+            "<div class='tfm-note'>Se cargó automáticamente <code>"
+            f"{html_lib.escape(default_stem)}</code>: fue una consulta "
+            "fuera del conjunto ('unknown') en la evaluación open-set del "
+            "Notebook 09. Puedes elegir otro audio y pulsar "
+            "<b>Cargar demo</b> cuando quieras.</div>"
+        )
+    else:
+        initial_value = options[0][1]
+        auto_load_note = (
+            "<div class='tfm-note'>No se pudo identificar automáticamente "
+            f"un audio 'unknown' del open-set ({html_lib.escape(default_reason)}); "
+            "se cargó el primero del orden habitual.</div>"
+        )
+
     dropdown = widgets.Dropdown(
         options=options,
+        value=initial_value,
         description="Audio:",
         layout=widgets.Layout(width="980px"),
         style={"description_width": "55px"},
@@ -2667,6 +2763,7 @@ def _render_demo_selector():
         description="Mostrar rutas raw/clean",
     )
 
+    display(HTML(auto_load_note))
     display(HTML(
         "<div class='tfm-note'>El selector está ordenado de mayor a "
         "menor número de segmentos reetiquetados. Cada carga reemplaza "
@@ -2719,6 +2816,10 @@ def _render_demo_selector():
             paths_checkbox.disabled = False
 
     load_button.on_click(_load)
+
+    # Carga automática inicial: renderiza de una vez el audio preseleccionado
+    # (idealmente el caso 'unknown' del open-set) sin esperar un clic.
+    _load(None)
 
     return {
         "options": options,

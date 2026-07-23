@@ -1,30 +1,34 @@
-"""Dashboard global e interactivo de resultados del TFM.
+"""Dashboard global de resultados del TFM — versión ligera.
 
-Este módulo reemplaza el Notebook 11 original. El notebook queda como
-orquestador y llama una sola función pública: ``run_dashboard_resultados_globales``.
+Este módulo reemplaza al Notebook 11: el notebook queda como orquestador y
+llama una sola función pública, ``run_dashboard_resultados_globales``.
 
-La fase solo lee outputs existentes desde Google Cloud Storage y los restaura
-localmente cuando hace falta. No sube, elimina ni modifica ningún objeto en GCS.
-El dashboard se genera como HTML autónomo con filtros y pestañas en JavaScript.
-No depende del kernel después de cargarse en JupyterLab.
+A diferencia de la versión anterior (que incrustaba decenas de miles de
+registros a nivel de segmento y generaba un HTML de decenas de MB), esta
+versión calcula en Python los **resultados agregados por fase** y solo incrusta
+esos resúmenes. El resultado es un HTML autónomo y ligero, con:
+
+- pestañas por fase (00 a 09), cada una con sus métricas finales y un gráfico
+  representativo;
+- un único filtro simple de corpus (Bajas vs Comerciales vs Todos);
+- sin tablas a nivel de segmento.
+
+La fase solo LEE outputs desde Google Cloud Storage y los restaura localmente
+cuando hace falta. No sube, elimina ni modifica ningún objeto en GCS.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any, Iterable
-
 import html as html_lib
 import json
-import math
 import warnings
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
 from IPython.display import HTML
-from plotly.offline import get_plotlyjs
-
 from pandas.errors import EmptyDataError
 
 from src import config as cfg
@@ -32,83 +36,45 @@ from src.storage_io import download_uri_to_local, join_gcs_uri
 
 warnings.filterwarnings("ignore")
 
+
 # ============================================================
-# CONFIGURACIÓN LOCAL DEL DASHBOARD
+# CONFIGURACIÓN LOCAL
 # ============================================================
 
 DATA_DIR = Path(cfg.DATA_DIR)
-PROJECT_DIR = Path(cfg.PROJECT_DIR)
+PROJECT_DIR = Path(getattr(cfg, "PROJECT_DIR", DATA_DIR.parent))
 DASHBOARD_DIR = DATA_DIR / "global_results_dashboard"
 HTML_DIR = DASHBOARD_DIR / "html_exports"
 HTML_PATH = HTML_DIR / "dashboard_resultados_globales.html"
 
-COLORS = {
-    "blue": "#2F6BFF",
-    "navy": "#123047",
-    "orange": "#F28E2B",
-    "green": "#2A9D6F",
-    "red": "#D1495B",
-    "purple": "#7B61A8",
-    "teal": "#2A9D8F",
-    "gray": "#7A8288",
-    "light": "#F4F7FA",
-}
-
 GCS_UNAV_ROOT = str(cfg.GCS_UNAV_ROOT)
 GCS_UNAV_CSV_PREFIX = str(cfg.GCS_UNAV_CSV_PREFIX)
 
-_GCS_CLIENT = None
+COLORS = {
+    "navy": "#123047", "blue": "#2F6BFF", "green": "#2A9D6F",
+    "orange": "#F28E2B", "red": "#D1495B", "purple": "#7B61A8",
+    "teal": "#2A9D8F", "gray": "#7A8288", "line": "#DDE5EA", "bg": "#F4FBF7",
+}
 
-
-# ============================================================
-# RUTAS DE ENTRADA
-# ============================================================
+_GCS_CLIENT: Any = None
 
 
 def _cfg_path(name: str, fallback: Path) -> Path:
-    """Obtiene una ruta desde ``src.config`` con fallback compatible."""
     return Path(getattr(cfg, name, fallback))
 
 
 EDA_DIR = _cfg_path("EDA_DIR", DATA_DIR / "eda")
 CLEAN_RESULTS_DIR = _cfg_path("CLEAN_RESULTS_DIR", DATA_DIR / "clean_results")
 DIARIZATION_DIR = _cfg_path("OUTPUT_DIR", DATA_DIR / "diarization_outputs")
-FINAL_RELABEL_DIR = _cfg_path(
-    "FINAL_RELABEL_DIR",
-    DIARIZATION_DIR / "final_relabel",
-)
-CONSOLIDATED_DIR = _cfg_path(
-    "CONSOLIDATED_DIR",
-    DIARIZATION_DIR / "consolidated",
-)
-TRANSCRIPTION_DIR = _cfg_path(
-    "TRANSCRIPTION_ROOT",
-    DATA_DIR / "transcription_outputs",
-)
-PROXY_DIR = _cfg_path(
-    "PROXY_GROUNDTRUTH_DIR",
-    DATA_DIR / "proxy_groundtruth_outputs",
-)
-SENTIMENT_DIR = _cfg_path(
-    "SENTIMENT_DIR",
-    DATA_DIR / "sentiment_outputs",
-)
-PROSODY_DIR = _cfg_path(
-    "PROSODY_DIR",
-    DATA_DIR / "prosody_outputs",
-)
-FUSION_DIR = _cfg_path(
-    "SENTIMENT_FUSION_DIR",
-    DATA_DIR / "sentiment_fusion_outputs",
-)
-KEYWORD_DIR = _cfg_path(
-    "KEYWORD_DIR",
-    DATA_DIR / "keyword_outputs",
-)
-VOICEPRINT_DIR = _cfg_path(
-    "VOICEPRINT_DIR",
-    DATA_DIR / "voiceprint_outputs",
-)
+FINAL_RELABEL_DIR = _cfg_path("FINAL_RELABEL_DIR", DIARIZATION_DIR / "final_relabel")
+CONSOLIDATED_DIR = _cfg_path("CONSOLIDATED_DIR", DIARIZATION_DIR / "consolidated")
+TRANSCRIPTION_DIR = _cfg_path("TRANSCRIPTION_ROOT", DATA_DIR / "transcription_outputs")
+PROXY_DIR = _cfg_path("PROXY_GROUNDTRUTH_DIR", DATA_DIR / "proxy_groundtruth_outputs")
+SENTIMENT_DIR = _cfg_path("SENTIMENT_DIR", DATA_DIR / "sentiment_outputs")
+PROSODY_DIR = _cfg_path("PROSODY_DIR", DATA_DIR / "prosody_outputs")
+FUSION_DIR = _cfg_path("SENTIMENT_FUSION_DIR", DATA_DIR / "sentiment_fusion_outputs")
+KEYWORD_DIR = _cfg_path("KEYWORD_DIR", DATA_DIR / "keyword_outputs")
+VOICEPRINT_DIR = _cfg_path("VOICEPRINT_DIR", DATA_DIR / "voiceprint_outputs")
 
 
 def _first_path(*paths: Path) -> Path:
@@ -118,58 +84,32 @@ def _first_path(*paths: Path) -> Path:
     return Path(paths[0])
 
 
+# Datasets necesarios para los agregados por fase (subconjunto del original).
 DATASET_PATHS: dict[str, Path] = {
     # Fase 00
-    "audio_inventory": _cfg_path(
-        "AUDIO_INVENTORY_PRIVATE_CSV",
-        EDA_DIR / "audio_inventory_private.csv",
-    ),
-    "metadata_snapshot": _cfg_path(
-        "BQ_METADATA_SNAPSHOT_CSV",
-        EDA_DIR / "bq_metadata_snapshot.csv",
-    ),
     "cleaning_results": _cfg_path(
         "CLEANING_RESULTS_PRIVATE_CSV",
         CLEAN_RESULTS_DIR / "audio_cleaning_results_private.csv",
     ),
     "silence_threshold_summary": _cfg_path(
-        "SILENCE_THRESHOLD_SUMMARY_CSV",
-        EDA_DIR / "silence_threshold_summary.csv",
+        "SILENCE_THRESHOLD_SUMMARY_CSV", EDA_DIR / "silence_threshold_summary.csv"
     ),
-
-    # Fases 01–04
+    # Fases 01-04
     "diarization_summary": _cfg_path(
-        "DIARIZATION_SUMMARY_CSV",
-        DIARIZATION_DIR / "diarization_summary.csv",
-    ),
-    "regular_segments": _cfg_path(
-        "DIARIZATION_ALL_REGULAR_SEGMENTS_CSV",
-        DIARIZATION_DIR / "diarization_all_regular_segments.csv",
+        "DIARIZATION_SUMMARY_CSV", DIARIZATION_DIR / "diarization_summary.csv"
     ),
     "scored_segments": _cfg_path(
         "DIARIZATION_ALL_SCORED_SEGMENTS_CSV",
         DIARIZATION_DIR / "diarization_all_scored_segments.csv",
-    ),
-    "valid_segments": _cfg_path(
-        "DIARIZATION_ALL_VALID_SEGMENTS_CSV",
-        DIARIZATION_DIR / "diarization_all_valid_segments.csv",
     ),
     "anchor_segments": _cfg_path(
         "DIARIZATION_ALL_ANCHOR_SEGMENTS_CSV",
         DIARIZATION_DIR / "diarization_all_anchor_segments.csv",
     ),
     "relabel_summary": _cfg_path(
-        "RELABEL_SUMMARY_CSV",
-        FINAL_RELABEL_DIR / "relabel_summary.csv",
+        "RELABEL_SUMMARY_CSV", FINAL_RELABEL_DIR / "relabel_summary.csv"
     ),
-    "final_segments": _cfg_path(
-        "ALL_FINAL_SEGMENTS_CSV",
-        FINAL_RELABEL_DIR / "all_final_segments.csv",
-    ),
-    "changed_segments": _cfg_path(
-        "ALL_CHANGED_SEGMENTS_CSV",
-        FINAL_RELABEL_DIR / "all_changed_segments.csv",
-    ),
+    "relabel_summary_by_audio": FINAL_RELABEL_DIR / "relabeling_summary_by_audio.csv",
     "final_merged_segments": _first_path(
         _cfg_path(
             "CONSOLIDATED_ALL_FINAL_MERGED_SEGMENTS_CSV",
@@ -180,350 +120,119 @@ DATASET_PATHS: dict[str, Path] = {
             FINAL_RELABEL_DIR / "all_final_merged_segments.csv",
         ),
     ),
-    "relabel_margin_summary": _cfg_path(
-        "RELABEL_MARGIN_SUMMARY_CSV",
-        DIARIZATION_DIR
-        / "relabel_margin_sensitivity"
-        / "relabel_margin_sensitivity_summary.csv",
-    ),
-    "relabel_margin_by_audio": _cfg_path(
-        "RELABEL_MARGIN_BY_AUDIO_CSV",
-        DIARIZATION_DIR
-        / "relabel_margin_sensitivity"
-        / "relabel_margin_sensitivity_by_audio.csv",
-    ),
-    "overlap_threshold_summary": _cfg_path(
-        "THRESHOLD_SUMMARY_CSV",
-        DIARIZATION_DIR / "overlap_analysis" / "overlap_threshold_summary.csv",
-    ),
-    "audio_overlap_summary": _cfg_path(
-        "AUDIO_OVERLAP_SUMMARY_CSV",
-        DIARIZATION_DIR / "overlap_analysis" / "audio_overlap_summary.csv",
-    ),
-
     # Fase 05
-    "transcribed_segments": _first_path(
+    "transcription_summary": _first_path(
         _cfg_path(
-            "TRANSCRIPTION_FINAL_SEGMENTS_CSV",
-            TRANSCRIPTION_DIR / "06_transcribed_segments_final.csv",
+            "TRANSCRIPTION_FINAL_SUMMARY_CSV",
+            TRANSCRIPTION_DIR / "06_transcription_summary_final.csv",
         ),
         _cfg_path(
-            "TRANSCRIPTION_ALL_SEGMENTS_CSV",
-            TRANSCRIPTION_DIR / "all_segments_transcribed.csv",
+            "TRANSCRIPTION_SUMMARY_CSV", TRANSCRIPTION_DIR / "transcription_summary.csv"
         ),
     ),
-    "transcription_summary": _cfg_path(
-        "TRANSCRIPTION_SUMMARY_CSV",
-        TRANSCRIPTION_DIR / "transcription_summary.csv",
-    ),
-    "transcription_final_summary": _cfg_path(
-        "TRANSCRIPTION_FINAL_SUMMARY_CSV",
-        TRANSCRIPTION_DIR / "06_transcription_summary_final.csv",
-    ),
-
     # Fase 06
-    "metadata_join_audit": PROXY_DIR / "metadata_join_audit_by_audio.csv",
-    "official_role_presence": PROXY_DIR / "official_role_presence_by_audio.csv",
-    "metadata_role_summary": PROXY_DIR / "metadata_role_summary.csv",
-    "official_turns": PROXY_DIR / "official_transcription_turns_extracted.csv",
-    "alignment_candidates": PROXY_DIR / "text_alignment_candidates.csv",
-    "alignment_matches": PROXY_DIR / "text_alignment_matches.csv",
-    "alignment_threshold_sensitivity": PROXY_DIR
-    / "text_alignment_threshold_sensitivity.csv",
-    "speaker_role_mapping": _cfg_path(
-        "PROXY_SPEAKER_ROLE_MAPPING_CSV",
-        PROXY_DIR / "speaker_role_mapping_textual.csv",
-    ),
-    "segment_proxy": _cfg_path(
-        "PROXY_SEGMENT_LEVEL_CSV",
-        PROXY_DIR / "segment_level_proxy_groundtruth.csv",
-    ),
     "proxy_metrics": _cfg_path(
-        "PROXY_TEXTUAL_METRICS_CSV",
-        PROXY_DIR / "textual_proxy_metrics_summary.csv",
+        "PROXY_TEXTUAL_METRICS_CSV", PROXY_DIR / "textual_proxy_metrics_summary.csv"
     ),
-    "alignment_processing_summary": _cfg_path(
-        "PROXY_ALIGNMENT_SUMMARY_CSV",
-        PROXY_DIR / "alignment_processing_summary.csv",
-    ),
-    "holdout_predictions": PROXY_DIR / "holdout_role_mapping_predictions.csv",
     "holdout_metrics": PROXY_DIR / "holdout_role_mapping_metrics.csv",
-
+    "segment_proxy": _cfg_path(
+        "PROXY_SEGMENT_LEVEL_CSV", PROXY_DIR / "segment_level_proxy_groundtruth.csv"
+    ),
     # Fase 07A
-    "text_sentiment_segments": _first_path(
-        _cfg_path(
-            "SEGMENTS_WITH_SENTIMENT_CSV",
-            SENTIMENT_DIR / "segments_with_sentiment_textual.csv",
-        ),
-        _cfg_path(
-            "ALL_SEGMENTS_SENTIMENT_ENRICHED_CSV",
-            SENTIMENT_DIR / "all_segments_sentiment_textual_enriched.csv",
-        ),
+    "sentiment_summary": _cfg_path(
+        "SENTIMENT_SUMMARY_CSV", SENTIMENT_DIR / "sentiment_textual_summary_for_memory.csv"
     ),
-    "call_sentiment": _cfg_path(
-        "CALL_SENTIMENT_CSV",
-        SENTIMENT_DIR / "call_level_sentiment_textual.csv",
-    ),
-    "call_role_sentiment": _cfg_path(
-        "CALL_ROLE_SENTIMENT_CSV",
-        SENTIMENT_DIR / "call_role_level_sentiment_textual.csv",
+    "sentiment_segments": _cfg_path(
+        "SEGMENTS_WITH_SENTIMENT_CSV", SENTIMENT_DIR / "segments_with_sentiment_textual.csv"
     ),
     "role_sentiment": _cfg_path(
-        "ROLE_SENTIMENT_CSV",
-        SENTIMENT_DIR / "role_level_sentiment_textual.csv",
+        "ROLE_SENTIMENT_CSV", SENTIMENT_DIR / "role_level_sentiment_textual.csv"
     ),
-    "sentiment_summary": _cfg_path(
-        "SENTIMENT_SUMMARY_CSV",
-        SENTIMENT_DIR / "sentiment_textual_summary_for_memory.csv",
-    ),
-
     # Fase 07B
-    "prosody_segments": _cfg_path(
-        "SEGMENTS_PROSODY_CSV",
-        PROSODY_DIR / "segments_with_audio_affect_prosody.csv",
+    "prosody_summary": _cfg_path(
+        "PROSODY_SUMMARY_CSV", PROSODY_DIR / "prosody_audio_affect_summary_for_memory.csv"
     ),
-    "call_prosody": _cfg_path(
-        "CALL_PROSODY_CSV",
-        PROSODY_DIR / "call_level_audio_affect_prosody.csv",
+    "prosody_segments": _cfg_path(
+        "SEGMENTS_PROSODY_CSV", PROSODY_DIR / "segments_with_audio_affect_prosody.csv"
     ),
     "role_prosody": _cfg_path(
-        "ROLE_PROSODY_CSV",
-        PROSODY_DIR / "role_level_audio_affect_prosody.csv",
-    ),
-    "prosody_summary": _cfg_path(
-        "PROSODY_SUMMARY_CSV",
-        PROSODY_DIR / "prosody_audio_affect_summary_for_memory.csv",
+        "ROLE_PROSODY_CSV", PROSODY_DIR / "role_level_audio_affect_prosody.csv"
     ),
     "ser_predictions": _cfg_path(
-        "SER_PREDICTIONS_CSV",
-        PROSODY_DIR / "ser_model_predictions.csv",
+        "SER_PREDICTIONS_CSV", PROSODY_DIR / "ser_model_predictions.csv"
     ),
-    "audio_text_comparison": _cfg_path(
-        "AUDIO_TEXT_COMPARISON_CSV",
-        PROSODY_DIR / "audio_vs_textual_sentiment_comparison.csv",
-    ),
-
     # Fase 07C
+    "fusion_summary": _cfg_path(
+        "FUSION_SUMMARY_CSV", FUSION_DIR / "fusion_summary_for_memory.csv"
+    ),
     "fusion_segments": _cfg_path(
-        "FUSION_SEGMENTS_CSV",
-        FUSION_DIR / "segments_audio_text_fusion.csv",
+        "FUSION_SEGMENTS_CSV", FUSION_DIR / "segments_audio_text_fusion.csv"
+    ),
+    "fusion_role_level": _cfg_path(
+        "FUSION_ROLE_LEVEL_CSV", FUSION_DIR / "role_level_audio_text_fusion.csv"
     ),
     "fusion_correlations": _cfg_path(
-        "FUSION_CORRELATIONS_CSV",
-        FUSION_DIR / "correlations_audio_text.csv",
-    ),
-    "fusion_confusion": _cfg_path(
-        "FUSION_CONFUSION_CSV",
-        FUSION_DIR / "confusion_prosodic_state_vs_sentiment.csv",
+        "FUSION_CORRELATIONS_CSV", FUSION_DIR / "correlations_audio_text.csv"
     ),
     "fusion_disagreement": _cfg_path(
         "FUSION_DISAGREEMENT_CSV",
         FUSION_DIR / "disagreement_masked_frustration_segments.csv",
     ),
-    "fusion_role_level": _cfg_path(
-        "FUSION_ROLE_LEVEL_CSV",
-        FUSION_DIR / "role_level_audio_text_fusion.csv",
-    ),
-    "fusion_call_level": _cfg_path(
-        "FUSION_CALL_LEVEL_CSV",
-        FUSION_DIR / "call_level_audio_text_fusion.csv",
-    ),
-    "fusion_summary": _cfg_path(
-        "FUSION_SUMMARY_CSV",
-        FUSION_DIR / "fusion_summary_for_memory.csv",
-    ),
-
     # Fase 08
     "keyword_segments": _cfg_path(
-        "SEGMENTS_WITH_KEYWORDS_CSV",
-        KEYWORD_DIR / "segments_with_keywords.csv",
+        "SEGMENTS_WITH_KEYWORDS_CSV", KEYWORD_DIR / "segments_with_keywords.csv"
     ),
     "keyword_calls": _cfg_path(
-        "CALL_LEVEL_KEYWORDS_CSV",
-        KEYWORD_DIR / "call_level_keywords.csv",
+        "CALL_LEVEL_KEYWORDS_CSV", KEYWORD_DIR / "call_level_keywords.csv"
     ),
-    "critical_calls": _cfg_path(
-        "TOP_CRITICAL_CALLS_CSV",
-        KEYWORD_DIR / "top_critical_calls_keywords.csv",
-    ),
-    "keyword_sentiment_calls": _cfg_path(
-        "CALL_KEYWORDS_SENTIMENT_CSV",
-        KEYWORD_DIR / "call_level_keywords_sentiment_combined.csv",
-    ),
-
     # Fase 09
-    "voiceprint_candidates": VOICEPRINT_DIR / "voiceprint_segments_candidates.csv",
-    "voiceprint_samples": VOICEPRINT_DIR / "voiceprint_audio_person_samples.csv",
-    "voiceprint_predictions": VOICEPRINT_DIR
-    / "open_set_identification_predictions.csv",
-    "voiceprint_identity_summary_open_set": VOICEPRINT_DIR
-    / "voiceprint_identity_summary_open_set.csv",
-    "voiceprint_identity_summary": VOICEPRINT_DIR
-    / "voiceprint_identity_summary.csv",
-    "voiceprint_identity_split": VOICEPRINT_DIR / "voiceprint_identity_split.csv",
-    "voiceprint_open_set_summary": _cfg_path(
-        "VOICEPRINT_OPEN_SET_SUMMARY_CSV",
-        VOICEPRINT_DIR / "voiceprint_open_set_final_summary.csv",
+    "voiceprint_verification_metrics": _cfg_path(
+        "METRICS_CSV", VOICEPRINT_DIR / "voiceprint_metrics_summary.csv"
     ),
     "voiceprint_final_summary": _cfg_path(
         "VOICEPRINT_FINAL_SUMMARY_CSV",
         VOICEPRINT_DIR / "voiceprint_final_summary_for_memory.csv",
     ),
-    "voiceprint_verification_metrics": VOICEPRINT_DIR
-    / "voiceprint_verification_metrics.csv",
-    "voiceprint_confusion": VOICEPRINT_DIR
-    / "open_set_decision_confusion_matrix.csv",
-    "voiceprint_pairwise_scores": VOICEPRINT_DIR
-    / "voiceprint_pairwise_scores.csv",
 }
 
-PHASE00_DATASETS = {
-    "audio_inventory",
-    "metadata_snapshot",
-    "cleaning_results",
-    "silence_threshold_summary",
-}
-
-PHASE_LABELS = {
-    "audio_inventory": "00 · Inventario",
-    "metadata_snapshot": "00 · Metadata",
-    "cleaning_results": "00 · Limpieza",
-    "silence_threshold_summary": "00 · Limpieza",
-    "diarization_summary": "01 · Diarización",
-    "regular_segments": "01 · Diarización",
-    "scored_segments": "01 · Diarización",
-    "valid_segments": "01 · Diarización",
-    "anchor_segments": "01 · Anchors",
-    "relabel_summary": "01 · Reetiquetado",
-    "final_segments": "01 · Reetiquetado",
-    "changed_segments": "01 · Reetiquetado",
-    "final_merged_segments": "04 · Consolidación",
-    "relabel_margin_summary": "02 · Sensibilidad",
-    "relabel_margin_by_audio": "02 · Sensibilidad",
-    "overlap_threshold_summary": "02 · Sensibilidad",
-    "audio_overlap_summary": "02 · Sensibilidad",
-    "transcribed_segments": "05 · Transcripción",
-    "transcription_summary": "05 · Transcripción",
-    "transcription_final_summary": "05 · Transcripción",
-    "metadata_join_audit": "06 · Proxy textual",
-    "official_role_presence": "06 · Proxy textual",
-    "metadata_role_summary": "06 · Proxy textual",
-    "official_turns": "06 · Proxy textual",
-    "alignment_candidates": "06 · Proxy textual",
-    "alignment_matches": "06 · Proxy textual",
-    "alignment_threshold_sensitivity": "06 · Proxy textual",
-    "speaker_role_mapping": "06 · Proxy textual",
-    "segment_proxy": "06 · Proxy textual",
-    "proxy_metrics": "06 · Proxy textual",
-    "alignment_processing_summary": "06 · Proxy textual",
-    "holdout_predictions": "06 · Proxy textual",
-    "holdout_metrics": "06 · Proxy textual",
-    "text_sentiment_segments": "07A · Sentimiento textual",
-    "call_sentiment": "07A · Sentimiento textual",
-    "call_role_sentiment": "07A · Sentimiento textual",
-    "role_sentiment": "07A · Sentimiento textual",
-    "sentiment_summary": "07A · Sentimiento textual",
-    "prosody_segments": "07B · Afecto acústico",
-    "call_prosody": "07B · Afecto acústico",
-    "role_prosody": "07B · Afecto acústico",
-    "prosody_summary": "07B · Afecto acústico",
-    "ser_predictions": "07B · Afecto acústico",
-    "audio_text_comparison": "07B · Afecto acústico",
-    "fusion_segments": "07C · Fusión audio-texto",
-    "fusion_correlations": "07C · Fusión audio-texto",
-    "fusion_confusion": "07C · Fusión audio-texto",
-    "fusion_disagreement": "07C · Fusión audio-texto",
-    "fusion_role_level": "07C · Fusión audio-texto",
-    "fusion_call_level": "07C · Fusión audio-texto",
-    "fusion_summary": "07C · Fusión audio-texto",
-    "keyword_segments": "08 · Keywords",
-    "keyword_calls": "08 · Keywords",
-    "critical_calls": "08 · Keywords",
-    "keyword_sentiment_calls": "08 · Keywords",
-    "voiceprint_candidates": "09 · Huella de voz",
-    "voiceprint_samples": "09 · Huella de voz",
-    "voiceprint_predictions": "09 · Huella de voz",
-    "voiceprint_identity_summary_open_set": "09 · Huella de voz",
-    "voiceprint_identity_summary": "09 · Huella de voz",
-    "voiceprint_identity_split": "09 · Huella de voz",
-    "voiceprint_open_set_summary": "09 · Huella de voz",
-    "voiceprint_final_summary": "09 · Huella de voz",
-    "voiceprint_verification_metrics": "09 · Huella de voz",
-    "voiceprint_confusion": "09 · Huella de voz",
-    "voiceprint_pairwise_scores": "09 · Huella de voz",
-}
+PHASE00_DATASETS = {"cleaning_results", "silence_threshold_summary"}
 
 
 # ============================================================
-# GCS: SOLO DESCARGA
+# RESTAURACIÓN DESDE GCS (solo lectura)
 # ============================================================
 
-
-def _gcs_uri_for_data_path(local_path: Path) -> str:
-    """Mapea una ruta local dentro de data/ a su equivalente en GCS."""
+def _gcs_uri_for_dataset(name: str, local_path: Path) -> str:
+    if name in PHASE00_DATASETS:
+        return join_gcs_uri(GCS_UNAV_CSV_PREFIX, Path(local_path).name)
     relative_path = Path(local_path).relative_to(DATA_DIR).as_posix()
     return join_gcs_uri(GCS_UNAV_ROOT, relative_path)
 
 
-def _gcs_uri_for_dataset(name: str, local_path: Path) -> str:
-    """Construye la URI remota respetando la estructura real del proyecto."""
-    if name in PHASE00_DATASETS:
-        return join_gcs_uri(GCS_UNAV_CSV_PREFIX, Path(local_path).name)
-    return _gcs_uri_for_data_path(local_path)
-
-
 def _restore_dataset(name: str, local_path: Path, force: bool = False) -> dict[str, Any]:
-    """Restaura un CSV desde GCS sin escribir nada en el bucket."""
-    if _GCS_CLIENT is None:
-        raise RuntimeError(
-            "El cliente GCS no está configurado. Ejecuta "
-            "run_dashboard_resultados_globales(gcs_client=...)."
-        )
-
     local_path = Path(local_path)
-    gcs_uri = _gcs_uri_for_dataset(name, local_path)
-    downloaded = False
-    error = ""
-
+    result = {"dataset": name, "available": False, "downloaded": False, "error": ""}
+    if _GCS_CLIENT is None:
+        result["available"] = local_path.exists() and local_path.stat().st_size > 0
+        return result
     try:
-        downloaded = bool(
+        result["downloaded"] = bool(
             download_uri_to_local(
-                source_uri=gcs_uri,
-                local_path=local_path,
-                gcs_client=_GCS_CLIENT,
-                force=force,
+                source_uri=_gcs_uri_for_dataset(name, local_path),
+                local_path=local_path, gcs_client=_GCS_CLIENT, force=force,
             )
         )
     except Exception as exc:
-        error = str(exc)
-
-    available = local_path.exists() and local_path.stat().st_size > 0
-
-    return {
-        "dataset": name,
-        "phase": PHASE_LABELS.get(name, ""),
-        "local_path": str(local_path),
-        "gcs_uri": gcs_uri,
-        "available": available,
-        "downloaded": downloaded,
-        "error": error,
-    }
+        result["error"] = str(exc)
+    result["available"] = local_path.exists() and local_path.stat().st_size > 0
+    return result
 
 
-def _restore_dashboard_inputs(force: bool = False) -> pd.DataFrame:
+def _restore_inputs(force: bool = False) -> pd.DataFrame:
     DASHBOARD_DIR.mkdir(parents=True, exist_ok=True)
     HTML_DIR.mkdir(parents=True, exist_ok=True)
-
-    rows = [
-        _restore_dataset(name, path, force=force)
-        for name, path in DATASET_PATHS.items()
-    ]
+    rows = [_restore_dataset(n, p, force=force) for n, p in DATASET_PATHS.items()]
     return pd.DataFrame(rows)
-
-
-# ============================================================
-# CARGA Y NORMALIZACIÓN
-# ============================================================
 
 
 def _read_csv_optional(path: Path) -> pd.DataFrame:
@@ -532,1206 +241,839 @@ def _read_csv_optional(path: Path) -> pd.DataFrame:
         return pd.DataFrame()
     try:
         return pd.read_csv(path, low_memory=False)
-    except EmptyDataError:
-        return pd.DataFrame()
-    except Exception as exc:
-        print(f"No se pudo leer {path.name}: {exc}")
+    except (EmptyDataError, Exception):
         return pd.DataFrame()
 
 
 def _load_datasets() -> dict[str, pd.DataFrame]:
-    return {
-        name: _read_csv_optional(path)
-        for name, path in DATASET_PATHS.items()
-    }
+    return {name: _read_csv_optional(path) for name, path in DATASET_PATHS.items()}
 
 
-def _first_col(df: pd.DataFrame, candidates: Iterable[str]) -> str | None:
-    if df.empty:
-        return None
-    exact = {str(column).lower(): str(column) for column in df.columns}
-    for candidate in candidates:
-        if candidate.lower() in exact:
-            return exact[candidate.lower()]
-    return None
+# ============================================================
+# UTILIDADES DE CORPUS Y COLUMNAS
+# ============================================================
 
-
-def _audio_col(df: pd.DataFrame) -> str | None:
-    return _first_col(
-        df,
-        [
-            "audio_id_base",
-            "audio_file",
-            "audio_base",
-            "audio_stem",
-            "file_stem",
-            "audio_id",
-            "filename",
-            "file",
-            "source_file",
-            "clean_audio_file",
-            "call_id",
-            "recording_id",
-        ],
-    )
-
-
-def _text_col(df: pd.DataFrame) -> str | None:
-    return _first_col(
-        df,
-        [
-            "text",
-            "transcription",
-            "transcribed_text",
-            "whisper_text",
-            "segment_text",
-            "texto",
-            "transcripcion_whisper",
-            "official_text",
-        ],
-    )
-
-
-def _role_col(df: pd.DataFrame) -> str | None:
-    return _first_col(
-        df,
-        [
-            "official_role_proxy",
-            "role_proxy",
-            "proxy_role",
-            "probable_role",
-            "role",
-            "official_role",
-            "speaker_role",
-        ],
-    )
-
-
-def _margin_col(df: pd.DataFrame) -> str | None:
-    return _first_col(
-        df,
-        [
-            "mean_label_margin",
-            "distance_margin",
-            "label_margin",
-            "margin",
-            "relabel_margin",
-            "tested_relabel_margin",
-        ],
-    )
-
-
-def _anchor_col(df: pd.DataFrame) -> str | None:
-    return _first_col(
-        df,
-        [
-            "is_anchor",
-            "anchor",
-            "anchor_flag",
-            "selected_as_anchor",
-        ],
-    )
-
-
-def _speaker_col(df: pd.DataFrame) -> str | None:
-    return _first_col(
-        df,
-        [
-            "speaker_final",
-            "speaker",
-            "speaker_original",
-            "label",
-        ],
-    )
-
-
-def _normalize_role(value: Any) -> str:
-    text = str(value).strip().lower()
-    if text in {"", "nan", "none", "null", "<na>"}:
-        return "Sin rol"
-    if "client" in text or "cliente" in text or text in {"customer", "user"}:
-        return "Cliente"
-    if "agent" in text or "agente" in text or "operator" in text:
-        return "Agente"
-    return str(value).strip().title()
-
-
-def _normalize_corpus_value(value: Any) -> str:
+def _norm_corpus(value: Any) -> str:
+    """Clasifica un audio en Bajas / Comerciales / No identificado."""
     text = str(value).strip().lower()
     if "baja" in text:
         return "Bajas"
-    if "comercial" in text or "venta" in text:
+    if "comercial" in text or "venta" in text or text.startswith("raw_") and "baja" not in text:
         return "Comerciales"
     if text in {"raw", "general", "comerciales"}:
         return "Comerciales"
     return "No identificado"
 
 
-def _add_filter_columns(df: pd.DataFrame) -> pd.DataFrame:
+def _audio_col(df: pd.DataFrame):
+    for c in [
+        "audio_file", "audio_file_norm", "audio_stem_norm", "audio",
+        "audio_id", "audio_stem", "filename", "file",
+    ]:
+        if c in df.columns:
+            return c
+    return None
+
+
+def _corpus_series(df: pd.DataFrame) -> pd.Series:
+    """Serie de corpus por fila (para el filtro simple)."""
     if df.empty:
-        return df.copy()
+        return pd.Series(dtype="object")
+    for c in ["corpus", "source_corpus", "source_dataset", "dataset", "source"]:
+        if c in df.columns:
+            return df[c].apply(_norm_corpus)
+    ac = _audio_col(df)
+    if ac:
+        return df[ac].apply(_norm_corpus)
+    return pd.Series(["No identificado"] * len(df), index=df.index)
 
-    output = df.copy()
 
-    corpus_col = _first_col(
-        output,
-        [
-            "corpus",
-            "source_corpus",
-            "dataset",
-            "source_type",
-            "audio_source",
-            "source",
-        ],
+def _filter_corpus(df: pd.DataFrame, corpus: str) -> pd.DataFrame:
+    """Filtra un DataFrame por corpus (Todos = sin filtrar)."""
+    if df.empty or corpus == "Todos":
+        return df
+    return df[_corpus_series(df).eq(corpus)]
+
+
+def _num(value, default=np.nan):
+    try:
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _metric(df, name, metric_cols=("metric", "Metric", "metrica", "métrica"),
+            value_cols=("value", "Value", "valor")):
+    """Valor de una métrica en una tabla larga metric/value (o metrica/valor)."""
+    if df.empty:
+        return np.nan
+    mc = next((c for c in metric_cols if c in df.columns), None)
+    vc = next((c for c in value_cols if c in df.columns), None)
+    if mc is None or vc is None:
+        return np.nan
+    hit = df[df[mc].astype(str).str.lower() == name.lower()]
+    return _num(hit.iloc[0][vc]) if len(hit) else np.nan
+
+
+def _parse_theme_cell(value) -> list:
+    """
+    Extrae los temas de una celda que puede venir como:
+    - repr de lista de Python: "['incidencia_tecnica', 'baja_cancelacion']"
+    - lista real ya parseada (si pandas la leyó como objeto)
+    - texto separado por | o ,
+    """
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(v).strip() for v in value if str(v).strip()]
+
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return []
+
+    if text.startswith("[") and text.endswith("]"):
+        import ast
+        try:
+            parsed = ast.literal_eval(text)
+            if isinstance(parsed, (list, tuple, set)):
+                return [str(v).strip() for v in parsed if str(v).strip()]
+        except (ValueError, SyntaxError):
+            # repr malformado: extraer tokens entre comillas como respaldo
+            tokens = re.findall(r"['\"]([^'\"]+)['\"]", text)
+            if tokens:
+                return [t.strip() for t in tokens if t.strip()]
+
+    return [t.strip() for t in re.split(r"[|,]", text) if t.strip()]
+
+
+def _top_themes_from_column(series: pd.Series, top_n: int = 6) -> list:
+    """Cuenta los temas más frecuentes de una columna con listas de temas por fila."""
+    counts: dict[str, int] = {}
+    for value in series.dropna():
+        for theme in _parse_theme_cell(value):
+            counts[theme] = counts.get(theme, 0) + 1
+    top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
+    return [[k, v] for k, v in top]
+
+
+# ============================================================
+# CÁLCULO DE AGREGADOS POR FASE (respetando el filtro de corpus)
+# ============================================================
+
+def compute_phase_aggregates(datasets: dict[str, pd.DataFrame], corpus: str) -> dict[str, Any]:
+    """
+    Calcula los resultados finales agregados de cada fase para un corpus dado.
+
+    Devuelve un dict por fase con: kpis (lista de [label, valor]) y chart
+    (dict con tipo y datos ya agregados, listos para incrustar ligero).
+    """
+    agg: dict[str, Any] = {}
+
+    def ff(df):  # filtro corpus abreviado
+        return _filter_corpus(df, corpus)
+
+    # ---- Fase 00: limpieza ----
+    clean = ff(datasets.get("cleaning_results", pd.DataFrame()))
+    dur_orig = dur_clean = np.nan
+    if not clean.empty:
+        oc = next((c for c in ["duration_original_sec", "original_duration_sec", "duration_before"] if c in clean.columns), None)
+        cc = next((c for c in ["duration_clean_sec", "clean_duration_sec", "duration_after"] if c in clean.columns), None)
+        if oc:
+            dur_orig = _num(pd.to_numeric(clean[oc], errors="coerce").mean())
+        if cc:
+            dur_clean = _num(pd.to_numeric(clean[cc], errors="coerce").mean())
+    reduction_pct = (
+        100 * (dur_orig - dur_clean) / dur_orig
+        if not np.isnan(_num(dur_orig)) and not np.isnan(_num(dur_clean)) and dur_orig else np.nan
     )
-    audio_col = _audio_col(output)
-
-    if corpus_col:
-        output["_dashboard_corpus"] = output[corpus_col].apply(
-            _normalize_corpus_value
-        )
-    elif audio_col:
-        output["_dashboard_corpus"] = output[audio_col].apply(
-            _normalize_corpus_value
-        )
-    else:
-        output["_dashboard_corpus"] = "No identificado"
-
-    role_col = _role_col(output)
-    if role_col:
-        output["_dashboard_role"] = output[role_col].apply(_normalize_role)
-    else:
-        output["_dashboard_role"] = "Sin rol"
-
-    margin_col = _margin_col(output)
-    if margin_col:
-        output["_dashboard_margin"] = pd.to_numeric(
-            output[margin_col],
-            errors="coerce",
-        )
-
-    anchor_col = _anchor_col(output)
-    if anchor_col:
-        output["_dashboard_anchor"] = (
-            output[anchor_col]
-            .astype(str)
-            .str.strip()
-            .str.lower()
-            .isin({"true", "1", "yes", "si", "sí", "anchor"})
-        )
-
-    return output
-
-
-def _prepare_datasets(
-    datasets: dict[str, pd.DataFrame],
-) -> dict[str, pd.DataFrame]:
-    return {
-        name: _add_filter_columns(df)
-        for name, df in datasets.items()
+    agg["00"] = {
+        "kpis": [
+            ["Audios en el corpus", len(clean) if not clean.empty else np.nan, "int"],
+            ["Duración media original (s)", dur_orig, "float1"],
+            ["Duración media limpia (s)", dur_clean, "float1"],
+        ],
+        "charts": [
+            {"type": "bars", "title": "Duración media (s)",
+             "items": [["Original", dur_orig], ["Limpio", dur_clean]], "unit": "s"},
+            {"type": "donut", "title": "Reducción media de duración", "pct": reduction_pct,
+             "label": "reducción", "color": COLORS["blue"]},
+        ],
     }
 
+    # ---- Fases 01-04: diarización ----
+    scored = ff(datasets.get("scored_segments", pd.DataFrame()))
+    anchors = ff(datasets.get("anchor_segments", pd.DataFrame()))
+    merged = ff(datasets.get("final_merged_segments", pd.DataFrame()))
+    relabel = datasets.get("relabel_summary", pd.DataFrame())
+    relabel_by_audio = ff(datasets.get("relabel_summary_by_audio", pd.DataFrame()))
 
-def _apply_filters(
-    df: pd.DataFrame,
-    corpus: str,
-    role: str,
-    margin_range: tuple[float, float],
-    anchor_mode: str,
-) -> pd.DataFrame:
-    if df.empty:
-        return df.copy()
+    n_final = len(merged) if not merged.empty else np.nan
+    n_audios_final = merged[_audio_col(merged)].nunique() if not merged.empty and _audio_col(merged) else np.nan
 
-    output = df.copy()
+    # Fuente principal: relabeling_summary_by_audio.csv (columnas reales
+    # confirmadas: audio_base/audio_file, n_segments, n_relabelled).
+    n_relabeled = n_relabel_base = np.nan
+    if not relabel_by_audio.empty:
+        seg_col = next((c for c in ["n_segments", "n_final_segments"] if c in relabel_by_audio.columns), None)
+        rel_col = next((c for c in ["n_relabelled", "n_relabeled", "n_changed_segments"] if c in relabel_by_audio.columns), None)
+        if seg_col and rel_col:
+            n_relabel_base = _num(pd.to_numeric(relabel_by_audio[seg_col], errors="coerce").sum())
+            n_relabeled = _num(pd.to_numeric(relabel_by_audio[rel_col], errors="coerce").sum())
 
-    if corpus != "Todos" and "_dashboard_corpus" in output.columns:
-        output = output[output["_dashboard_corpus"].eq(corpus)]
+    if np.isnan(n_relabeled) and not merged.empty:  # fallback: columna booleana por segmento
+        ch = next((c for c in ["changed", "relabeled", "was_relabeled"] if c in merged.columns), None)
+        if ch:
+            n_relabeled = int(merged[ch].astype(str).str.lower().isin(["true", "1", "yes"]).sum())
+            n_relabel_base = n_final
 
-    if role != "Todos" and "_dashboard_role" in output.columns:
-        output = output[output["_dashboard_role"].eq(role)]
-
-    if "_dashboard_margin" in output.columns:
-        minimum, maximum = margin_range
-        margin_values = pd.to_numeric(
-            output["_dashboard_margin"],
-            errors="coerce",
+    if np.isnan(n_relabeled):  # último fallback: métrica agregada en relabel_summary
+        pct_relabel = _metric(relabel, "pct_relabeled")
+        pct_relabel = pct_relabel * 100 if not np.isnan(pct_relabel) and pct_relabel <= 1 else pct_relabel
+    else:
+        pct_relabel = (
+            100 * n_relabeled / n_relabel_base
+            if n_relabel_base and not np.isnan(n_relabel_base) else np.nan
         )
-        output = output[
-            margin_values.isna()
-            | margin_values.between(minimum, maximum, inclusive="both")
-        ]
+    agg["01"] = {
+        "kpis": [
+            ["Segmentos puntuados", len(scored) if not scored.empty else np.nan, "int"],
+            ["Anchors", len(anchors) if not anchors.empty else np.nan, "int"],
+            ["Segmentos finales", n_final, "int"],
+            ["Audios consolidados", n_audios_final, "int"],
+            ["Reetiquetados", pct_relabel, "pct1"],
+        ],
+        "charts": [
+            {"type": "funnel", "title": "Embudo de segmentos",
+             "items": [["Puntuados", len(scored) if not scored.empty else 0],
+                       ["Anchors", len(anchors) if not anchors.empty else 0],
+                       ["Finales", n_final if not np.isnan(_num(n_final)) else 0]]},
+            {"type": "donut", "title": "Segmentos reetiquetados", "pct": pct_relabel,
+             "label": "reetiquetados", "color": COLORS["orange"]},
+        ],
+    }
 
-    if anchor_mode != "Todos" and "_dashboard_anchor" in output.columns:
-        keep_anchor = anchor_mode == "Solo anchors"
-        output = output[output["_dashboard_anchor"].eq(keep_anchor)]
+    # ---- Fase 05: transcripción ----
+    trans = ff(datasets.get("transcription_summary", pd.DataFrame()))
+    cov = np.nan
+    with_text = without_text = np.nan
+    if not trans.empty and "n_segments_with_text" in trans.columns and "n_diarized_segments" in trans.columns:
+        with_text = int(trans["n_segments_with_text"].sum())
+        total = int(trans["n_diarized_segments"].sum())
+        without_text = total - with_text
+        cov = 100 * with_text / max(1, total)
+    agg["05"] = {
+        "kpis": [
+            ["Cobertura textual", cov, "pct2"],
+            ["Segmentos con texto", with_text, "int"],
+            ["Segmentos sin texto", without_text, "int"],
+        ],
+        "charts": [
+            {"type": "donut", "title": "Cobertura textual", "pct": cov,
+             "label": "con texto", "color": COLORS["blue"]},
+            {"type": "bars", "title": "Segmentos con vs. sin texto",
+             "items": [["Con texto", with_text], ["Sin texto", without_text]], "unit": ""},
+        ],
+    }
 
-    return output
+    # ---- Fase 06: proxy de roles ----
+    holdout = datasets.get("holdout_metrics", pd.DataFrame())
+    seg_proxy = ff(datasets.get("segment_proxy", pd.DataFrame()))
+    acc = _metric(holdout, "holdout_accuracy")
+    bacc = _metric(holdout, "holdout_balanced_accuracy")
+    acc = acc * 100 if not np.isnan(acc) and acc <= 1 else acc
+    bacc = bacc * 100 if not np.isnan(bacc) and bacc <= 1 else bacc
+    n_agent = n_client = np.nan
+    if not seg_proxy.empty and "official_role_proxy" in seg_proxy.columns:
+        rp = seg_proxy["official_role_proxy"].astype(str).str.upper()
+        n_agent = int((rp == "AGENT").sum())
+        n_client = int((rp == "CLIENT").sum())
+    agg["06"] = {
+        "kpis": [
+            ["Accuracy holdout", acc, "pct2"],
+            ["Balanced accuracy", bacc, "pct2"],
+            ["Segmentos AGENT", n_agent, "int"],
+            ["Segmentos CLIENT", n_client, "int"],
+        ],
+        "charts": [
+            {"type": "bars", "title": "Segmentos por rol proxy",
+             "items": [["AGENT", n_agent], ["CLIENT", n_client]], "unit": ""},
+            {"type": "donut", "title": "Balanced accuracy holdout", "pct": bacc,
+             "label": "balanced acc.", "color": COLORS["green"]},
+        ],
+    }
 
+    # ---- Fase 07A: sentimiento textual ----
+    # Nombres reales confirmados en sentiment_textual_summary_for_memory.csv:
+    # pct_negative_segments / pct_neutral_segments / pct_positive_segments,
+    # AGENT_avg_sentiment / CLIENT_avg_sentiment, segments_analyzed_sentiment.
+    sent_seg = ff(datasets.get("sentiment_segments", pd.DataFrame()))
+    sent = datasets.get("sentiment_summary", pd.DataFrame())
+    role_sent = datasets.get("role_sentiment", pd.DataFrame())
 
+    pct_neg = pct_neu = pct_pos = np.nan
+    agent_s = client_s = np.nan
+    n_sent_seg = np.nan
+
+    if not sent_seg.empty and "sentiment_label" in sent_seg.columns:
+        n_sent_seg = len(sent_seg)
+        lab = sent_seg["sentiment_label"].astype(str).str.lower()
+        pct_neg = 100 * (lab == "negative").mean()
+        pct_neu = 100 * (lab == "neutral").mean()
+        pct_pos = 100 * (lab == "positive").mean()
+        rc = next((c for c in ["role_proxy", "official_role_proxy", "role"] if c in sent_seg.columns), None)
+        nc = "sentiment_numeric" if "sentiment_numeric" in sent_seg.columns else None
+        if rc and nc:
+            grp = sent_seg.groupby(sent_seg[rc].astype(str).str.upper())[nc].mean()
+            agent_s = _num(grp.get("AGENT"))
+            client_s = _num(grp.get("CLIENT"))
+
+    if np.isnan(pct_neg):  # Fallback: summary con nombres reales del pipeline
+        pct_neg = _metric(sent, "pct_negative_segments")
+        pct_neu = _metric(sent, "pct_neutral_segments")
+        pct_pos = _metric(sent, "pct_positive_segments")
+        if np.isnan(pct_neg):  # Fallback adicional: nombre genérico corto
+            pct_neg = _metric(sent, "pct_negative")
+            pct_neu = _metric(sent, "pct_neutral")
+            pct_pos = _metric(sent, "pct_positive")
+        pct_neg = pct_neg * 100 if not np.isnan(pct_neg) and pct_neg <= 1 else pct_neg
+        pct_neu = pct_neu * 100 if not np.isnan(pct_neu) and pct_neu <= 1 else pct_neu
+        pct_pos = pct_pos * 100 if not np.isnan(pct_pos) and pct_pos <= 1 else pct_pos
+        n_sent_seg = _metric(sent, "segments_analyzed_sentiment")
+
+    if np.isnan(_num(agent_s)):
+        agent_s = _metric(sent, "AGENT_avg_sentiment")
+        client_s = _metric(sent, "CLIENT_avg_sentiment")
+        if np.isnan(_num(agent_s)) and not role_sent.empty:
+            rc = next((c for c in ["role_proxy", "official_role_proxy", "role"] if c in role_sent.columns), None)
+            mc = next((c for c in ["avg_sentiment", "mean_sentiment"] if c in role_sent.columns), None)
+            if rc and mc:
+                for _, r in role_sent.iterrows():
+                    if str(r[rc]).upper() == "AGENT":
+                        agent_s = _num(r[mc])
+                    elif str(r[rc]).upper() == "CLIENT":
+                        client_s = _num(r[mc])
+
+    agg["07A"] = {
+        "kpis": [
+            ["Segmentos analizados", n_sent_seg, "int"],
+            ["Neutrales", pct_neu, "pct1"],
+            ["Negativos", pct_neg, "pct1"],
+            ["Sent. medio AGENT", agent_s, "signed3"],
+            ["Sent. medio CLIENT", client_s, "signed3"],
+        ],
+        "charts": [
+            {"type": "stacked", "title": "Distribución de sentimiento",
+             "items": [["Negativo", pct_neg, COLORS["red"]],
+                       ["Neutral", pct_neu, COLORS["gray"]],
+                       ["Positivo", pct_pos, COLORS["green"]]]},
+            {"type": "diverging", "title": "Sentimiento medio por rol",
+             "items": [["Agente", agent_s], ["Cliente", client_s]]},
+        ],
+    }
+
+    # ---- Fase 07B: afecto de audio ----
+    # Nombres reales confirmados en segments_with_audio_affect_prosody.csv:
+    # audio_stem_norm/audio_file_norm, role_proxy_for_prosody, arousal_proxy_score,
+    # tension_proxy_score, intensity_proxy_score, prosodic_state_proxy, ser_pred_label.
+    pros_seg = ff(datasets.get("prosody_segments", pd.DataFrame()))
+    ser = ff(datasets.get("ser_predictions", pd.DataFrame()))
+    role_pros = datasets.get("role_prosody", pd.DataFrame())
+
+    ser_items, state_items = [], []
+    arousal_m = tension_m = intensity_m = np.nan
+    n_pros = np.nan
+    role_col_pros = None
+
+    if not pros_seg.empty:
+        n_pros = len(pros_seg)
+        if "arousal_proxy_score" in pros_seg.columns:
+            arousal_m = _num(pd.to_numeric(pros_seg["arousal_proxy_score"], errors="coerce").mean())
+        if "tension_proxy_score" in pros_seg.columns:
+            tension_m = _num(pd.to_numeric(pros_seg["tension_proxy_score"], errors="coerce").mean())
+        if "intensity_proxy_score" in pros_seg.columns:
+            intensity_m = _num(pd.to_numeric(pros_seg["intensity_proxy_score"], errors="coerce").mean())
+        state_col = next((c for c in ["prosodic_state_proxy", "ser_pred_label"] if c in pros_seg.columns), None)
+        if state_col:
+            top = pros_seg[state_col].astype(str).value_counts().head(6)
+            state_items = [[k, int(v)] for k, v in top.items() if k.lower() != "nan"]
+        role_col_pros = next(
+            (c for c in ["role_proxy_for_prosody", "role_proxy", "role"] if c in pros_seg.columns), None
+        )
+
+    ser_src = ser if not ser.empty else pros_seg
+    if not ser_src.empty:
+        lc = next(
+            (c for c in ["ser_pred_label", "ser_label", "emotion", "label", "predicted_emotion"]
+             if c in ser_src.columns), None,
+        )
+        if lc:
+            top = ser_src[lc].astype(str).value_counts().head(6)
+            ser_items = [[k, int(v)] for k, v in top.items() if k.lower() != "nan"]
+
+    # Segundo gráfico: activación/tensión por rol, desde tabla agregada por rol
+    # (role_level_audio_affect_prosody.csv) si existe; si no, desde los segmentos.
+    role_arousal_items = []
+    if not role_pros.empty:
+        rc = next((c for c in ["role_proxy_for_prosody", "role_proxy", "role"] if c in role_pros.columns), None)
+        ac = next((c for c in ["arousal_proxy_score_mean", "arousal_proxy_score"] if c in role_pros.columns), None)
+        if rc and ac:
+            for _, r in role_pros.iterrows():
+                role_arousal_items.append([str(r[rc]).upper(), _num(r[ac])])
+    elif not pros_seg.empty and role_col_pros and "arousal_proxy_score" in pros_seg.columns:
+        grp = pros_seg.groupby(pros_seg[role_col_pros].astype(str).str.upper())["arousal_proxy_score"].mean()
+        role_arousal_items = [[k, _num(v)] for k, v in grp.items()]
+
+    agg["07B"] = {
+        "kpis": [
+            ["Segmentos con afecto", n_pros, "int"],
+            ["Activación media", arousal_m, "float3"],
+            ["Tensión media", tension_m, "float3"],
+            ["Intensidad media", intensity_m, "float3"],
+        ],
+        "charts": [
+            {"type": "bars", "title": "Etiquetas SER más frecuentes",
+             "items": ser_items or [["Sin datos", 0]], "unit": ""},
+            {"type": "bars", "title": "Activación media por rol",
+             "items": role_arousal_items or [["Sin datos", 0]], "unit": "", "color": COLORS["orange"]},
+        ],
+    }
+
+    # ---- Fase 07C: fusión audio-texto ----
+    # Nombres reales confirmados en fusion_summary_for_memory.csv: columnas en
+    # ESPAÑOL "metrica"/"valor" (no "metric"/"value"). Métricas: segmentos_totales,
+    # segmentos_comparables, pearson_<indicador>, pct_frustracion_enmascarada.
+    # correlations_audio_text.csv usa columnas score_audio/pearson_r/spearman_r.
+    fusion = datasets.get("fusion_summary", pd.DataFrame())
+    fus_seg = ff(datasets.get("fusion_segments", pd.DataFrame()))
+    fus_role = datasets.get("fusion_role_level", pd.DataFrame())
+    fus_disagree = ff(datasets.get("fusion_disagreement", pd.DataFrame()))
+    corr = datasets.get("fusion_correlations", pd.DataFrame())
+
+    total_seg = _metric(fusion, "segmentos_totales")
+    comparable_seg = _metric(fusion, "segmentos_comparables")
+    if np.isnan(total_seg) and not fus_seg.empty:
+        total_seg = len(fus_seg)
+        if {"has_audio", "has_text"}.issubset(fus_seg.columns):
+            comparable_seg = int((fus_seg["has_audio"] & fus_seg["has_text"]).sum())
+    cov_fus = (100 * comparable_seg / total_seg) if (not np.isnan(total_seg) and total_seg) else np.nan
+
+    n_disc = len(fus_disagree) if not fus_disagree.empty else np.nan
+    if np.isnan(n_disc):
+        pct_disc = _metric(fusion, "pct_frustracion_enmascarada")
+        if not np.isnan(pct_disc) and not np.isnan(comparable_seg):
+            n_disc = round(pct_disc / 100 * comparable_seg)
+
+    corr_items = []
+    corr_act = np.nan
+    if not corr.empty:
+        score_col = next((c for c in ["score_audio", "indicator", "variable"] if c in corr.columns), None)
+        r_col = next((c for c in ["pearson_r", "correlation", "corr", "value"] if c in corr.columns), None)
+        if score_col and r_col:
+            for _, r in corr.iterrows():
+                corr_items.append([str(r[score_col]).replace("_proxy_score", "").replace("ser_neg_prob", "ser_neg"), _num(r[r_col])])
+            hit = corr[corr[score_col].astype(str).str.contains("arousal", case=False, na=False)]
+            if len(hit):
+                corr_act = _num(hit.iloc[0][r_col])
+    if not corr_items:
+        corr_act = _metric(fusion, "pearson_arousal_proxy_score")
+
+    agg["07C"] = {
+        "kpis": [
+            ["Cobertura audio–texto", cov_fus, "pct1"],
+            ["Discordancia voz≠texto", n_disc, "int"],
+            ["Corr. texto·activación", corr_act, "signed3"],
+        ],
+        "charts": [
+            {"type": "donut", "title": "Cobertura comparable", "pct": cov_fus,
+             "label": "audio–texto", "color": COLORS["teal"]},
+            {"type": "diverging", "title": "Correlación sentimiento vs. indicadores de audio",
+             "items": corr_items or [["Sin datos", 0]]},
+        ],
+    }
+
+    # ---- Fase 08: keyword spotting ----
+    kw_seg = ff(datasets.get("keyword_segments", pd.DataFrame()))
+    pct_kw = np.nan
+    theme_items = []
+    if not kw_seg.empty:
+        if "has_critical_keyword" in kw_seg.columns:
+            pct_kw = 100 * _num(kw_seg["has_critical_keyword"].astype(str).str.lower().isin(["true", "1", "yes"]).mean())
+        tc = next((c for c in [
+            "critical_themes_detected", "critical_theme", "theme", "critical_themes",
+        ] if c in kw_seg.columns), None)
+        if tc:
+            theme_items = _top_themes_from_column(kw_seg[tc], top_n=6)
+    agg["08"] = {
+        "kpis": [
+            ["Segmentos con keyword", pct_kw, "pct1"],
+            ["Temas críticos detectados", len(theme_items) if theme_items else np.nan, "int"],
+        ],
+        "charts": [
+            {"type": "bars", "title": "Temas críticos más frecuentes",
+             "items": theme_items or [["Sin datos", 0]], "unit": ""},
+            {"type": "donut", "title": "Segmentos con keyword crítica", "pct": pct_kw,
+             "label": "con keyword", "color": COLORS["purple"]},
+        ],
+    }
+
+    # ---- Fase 09: huella de voz ----
+    # Columna real confirmada: "dataset" (no "set"), valores como
+    # calibration_agents / test_agents_unseen / test_clients_repeated.
+    vp = datasets.get("voiceprint_verification_metrics", pd.DataFrame())
+    vp_items = []
+    acc_items = []
+    auc_main = eer_main = np.nan
+    if not vp.empty:
+        sc = next((c for c in ["dataset", "set", "conjunto", "subset"] if c in vp.columns), None)
+        ac = next((c for c in ["auc", "AUC"] if c in vp.columns), None)
+        accc = next((c for c in ["accuracy", "acc", "Accuracy"] if c in vp.columns), None)
+        eerc = next((c for c in ["eer", "EER"] if c in vp.columns), None)
+        if sc and ac:
+            for _, r in vp.iterrows():
+                vp_items.append([str(r[sc]), _num(r[ac])])
+            hit = vp[vp[sc].astype(str).str.contains("no vistos|unseen|held", case=False, na=False)]
+            auc_main = _num(hit.iloc[0][ac]) if len(hit) else _num(vp[ac].max())
+            if eerc and len(hit):
+                eer_main = _num(hit.iloc[0][eerc])
+        if sc and accc:
+            for _, r in vp.iterrows():
+                acc_items.append([str(r[sc]), 100 * _num(r[accc])])
+    agg["09"] = {
+        "kpis": [
+            ["AUC agentes no vistos", auc_main, "float3"],
+            ["EER agentes no vistos", eer_main, "float3"],
+        ],
+        "charts": [
+            {"type": "bars", "title": "AUC por conjunto",
+             "items": vp_items or [["Sin datos", 0]], "unit": "", "vmax": 1.0},
+            {"type": "bars", "title": "Accuracy por conjunto (%)",
+             "items": acc_items or [["Sin datos", 0]], "unit": "%", "vmax": 100, "color": COLORS["green"]},
+        ],
+    }
+
+    return agg
 
 
 # ============================================================
-# DASHBOARD HTML AUTÓNOMO
+# FORMATO Y GRÁFICOS SVG (ligeros)
 # ============================================================
 
-
-def _global_margin_range(
-    datasets: dict[str, pd.DataFrame],
-) -> tuple[float, float]:
-    values: list[pd.Series] = []
-    for name in ["final_segments", "changed_segments", "relabel_margin_by_audio"]:
-        df = datasets.get(name, pd.DataFrame())
-        margin_col = _margin_col(df)
-        if not df.empty and margin_col:
-            series = pd.to_numeric(df[margin_col], errors="coerce").dropna()
-            if not series.empty:
-                values.append(series)
-
-    if not values:
-        return 0.0, 1.0
-
-    combined = pd.concat(values, ignore_index=True)
-    minimum = float(combined.min())
-    maximum = float(combined.max())
-
-    if math.isclose(minimum, maximum):
-        maximum = minimum + 0.01
-
-    return minimum, maximum
-
-
-def _global_roles(datasets: dict[str, pd.DataFrame]) -> list[str]:
-    roles: set[str] = set()
-    for df in datasets.values():
-        if "_dashboard_role" in df.columns:
-            roles.update(
-                role
-                for role in df["_dashboard_role"].dropna().astype(str).unique()
-                if role not in {"", "Sin rol", "Nan", "None", "<NA>"}
-            )
-
-    preferred = [role for role in ["Cliente", "Agente"] if role in roles]
-    remaining = sorted(roles - set(preferred))
-    return ["Todos", *preferred, *remaining]
-
-
-def _json_default(value: Any) -> Any:
-    if isinstance(value, (np.integer,)):
-        return int(value)
-    if isinstance(value, (np.floating,)):
-        if np.isnan(value):
-            return None
-        return float(value)
-    if isinstance(value, (np.bool_,)):
-        return bool(value)
-    if isinstance(value, Path):
-        return str(value)
-    if pd.isna(value):
-        return None
+def _fmt(value, kind="int"):
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return "—"
+    if kind == "int":
+        return f"{int(round(value)):,}".replace(",", ".")
+    if kind == "pct1":
+        return f"{value:.1f}%".replace(".", ",")
+    if kind == "pct2":
+        return f"{value:.2f}%".replace(".", ",")
+    if kind == "float1":
+        return f"{value:.1f}".replace(".", ",")
+    if kind == "float3":
+        return f"{value:.3f}".replace(".", ",")
+    if kind == "signed3":
+        return f"{value:+.3f}".replace(".", ",")
     return str(value)
 
 
-def _json_dumps(payload: Any) -> str:
-    return json.dumps(
-        payload,
-        ensure_ascii=False,
-        allow_nan=False,
-        default=_json_default,
-        separators=(",", ":"),
+def _svg_bars(items, unit="", vmax=None, color=None, height=None):
+    color = color or COLORS["teal"]
+    items = [(str(l), _num(v, 0.0)) for l, v in items]
+    if not items or all(v == 0 for _, v in items):
+        return "<div style='color:#7A8288;font-size:13px;'>Sin datos.</div>"
+    vmax = vmax or max(v for _, v in items) or 1
+    row_h = 34
+    height = height or (len(items) * row_h + 16)
+    width, label_w, pad = 460, 150, 55
+    bar_w = width - label_w - pad
+    rows = []
+    for i, (label, value) in enumerate(items):
+        y = 8 + i * row_h
+        w = max(2, bar_w * (value / vmax))
+        vtxt = f"{value:,.0f}".replace(",", ".") if value >= 100 else f"{value:.2f}".replace(".", ",")
+        rows.append(
+            f"<text x='0' y='{y + 18:.0f}' font-size='12' fill='#123047'>{html_lib.escape(label[:22])}</text>"
+            f"<rect x='{label_w}' y='{y:.0f}' width='{w:.0f}' height='20' rx='4' fill='{color}'/>"
+            f"<text x='{label_w + w + 6:.0f}' y='{y + 15:.0f}' font-size='11' fill='#456257'>{vtxt}{unit}</text>"
+        )
+    return f"<svg viewBox='0 0 {width} {height}' width='100%' style='max-width:480px'>" + "".join(rows) + "</svg>"
+
+
+def _svg_donut(pct, label, color):
+    if pct is None or (isinstance(pct, float) and np.isnan(pct)):
+        return "<div style='color:#7A8288;font-size:13px;'>Sin datos.</div>"
+    import math
+    r, cx, cy = 58, 120, 72
+    circ = 2 * math.pi * r
+    frac = max(0.0, min(1.0, pct / 100))
+    disp = f"{pct:.1f}%".replace(".", ",")
+    return (
+        f"<svg viewBox='0 0 240 148' width='100%' style='max-width:260px'>"
+        f"<circle cx='{cx}' cy='{cy}' r='{r}' fill='none' stroke='#E4F0EA' stroke-width='17'/>"
+        f"<circle cx='{cx}' cy='{cy}' r='{r}' fill='none' stroke='{color}' stroke-width='17' "
+        f"stroke-dasharray='{circ*frac:.1f} {circ:.1f}' stroke-linecap='round' transform='rotate(-90 {cx} {cy})'/>"
+        f"<text x='{cx}' y='{cy+2}' font-size='26' font-weight='750' fill='#123047' text-anchor='middle'>{disp}</text>"
+        f"<text x='{cx}' y='{cy+22}' font-size='11' fill='#456257' text-anchor='middle'>{html_lib.escape(label)}</text>"
+        f"</svg>"
     )
 
 
-def _series_from_candidates(
-    df: pd.DataFrame,
-    candidates: Iterable[str],
-    default: Any = None,
-) -> pd.Series:
-    column = _first_col(df, candidates)
-    if column:
-        return df[column]
-    return pd.Series([default] * len(df), index=df.index)
-
-
-def _numeric_series(
-    df: pd.DataFrame,
-    candidates: Iterable[str],
-) -> pd.Series:
-    return pd.to_numeric(
-        _series_from_candidates(df, candidates, np.nan),
-        errors="coerce",
+def _svg_stacked(items):
+    """Barra apilada horizontal 100% (para distribución de sentimiento)."""
+    items = [(str(l), _num(v, 0.0), c) for l, v, c in items]
+    total = sum(v for _, v, _ in items) or 1
+    width, h = 460, 46
+    x = 0
+    parts, legend = [], []
+    for label, value, color in items:
+        w = width * (value / total)
+        parts.append(f"<rect x='{x:.0f}' y='0' width='{w:.0f}' height='{h}' fill='{color}'/>")
+        if w > 40:
+            parts.append(f"<text x='{x + w/2:.0f}' y='{h/2 + 4:.0f}' font-size='12' fill='white' text-anchor='middle'>{value:.0f}%</text>")
+        legend.append(f"<span style='font-size:12px;color:#456257;margin-right:14px;'><span style='display:inline-block;width:10px;height:10px;background:{color};border-radius:2px;margin-right:4px;'></span>{html_lib.escape(label)}</span>")
+        x += w
+    return (
+        f"<svg viewBox='0 0 {width} {h}' width='100%' style='max-width:480px'>" + "".join(parts) + "</svg>"
+        f"<div style='margin-top:8px;'>{''.join(legend)}</div>"
     )
 
 
-def _boolean_series(
-    df: pd.DataFrame,
-    candidates: Iterable[str],
-) -> pd.Series:
-    column = _first_col(df, candidates)
-    if not column:
-        return pd.Series(pd.array([pd.NA] * len(df), dtype="boolean"), index=df.index)
+def _svg_funnel(items):
+    """Embudo simple (segmentos puntuados → anchors → finales)."""
+    items = [(str(l), _num(v, 0.0)) for l, v in items]
+    if not items or all(v == 0 for _, v in items):
+        return "<div style='color:#7A8288;font-size:13px;'>Sin datos.</div>"
+    vmax = max(v for _, v in items) or 1
+    width, row_h = 460, 44
+    rows = []
+    for i, (label, value) in enumerate(items):
+        w = max(20, (width - 120) * (value / vmax))
+        x = (width - 120 - w) / 2
+        y = 6 + i * row_h
+        rows.append(
+            f"<rect x='{x:.0f}' y='{y:.0f}' width='{w:.0f}' height='30' rx='4' fill='{COLORS['teal']}' opacity='{1 - i*0.18:.2f}'/>"
+            f"<text x='{width-110}' y='{y + 20:.0f}' font-size='12' fill='#123047'>{html_lib.escape(label)}: {value:,.0f}</text>".replace(",", ".")
+        )
+    return f"<svg viewBox='0 0 {width} {len(items)*row_h + 12}' width='100%' style='max-width:480px'>" + "".join(rows) + "</svg>"
 
-    values = df[column]
-    normalized = values.astype(str).str.strip().str.lower()
-    result = normalized.isin(
-        {"true", "1", "yes", "si", "sí", "same", "positive", "match", "known"}
-    ).astype("boolean")
-    result[values.isna()] = pd.NA
-    return result
+
+def _svg_diverging(items):
+    """Barras divergentes centradas en 0 (para correlaciones y medias con signo)."""
+    items = [(str(l), _num(v, 0.0)) for l, v in items]
+    if not items or all(v == 0 for _, v in items):
+        return "<div style='color:#7A8288;font-size:13px;'>Sin datos.</div>"
+    width, mid, row_h = 460, 230, 40
+    span = max(0.05, max(abs(v) for _, v in items) * 1.25)
+    height = 12 + len(items) * row_h
+    rows = [f"<line x1='{mid}' y1='4' x2='{mid}' y2='{height-4}' stroke='#CFE8DD' stroke-width='1'/>"]
+    for i, (label, value) in enumerate(items):
+        y = 8 + i * row_h
+        w = (mid - 65) * (abs(value) / span)
+        color = COLORS["red"] if value < 0 else COLORS["green"]
+        x = mid - w if value < 0 else mid
+        vtxt = f"{value:+.3f}".replace(".", ",")
+        rows.append(
+            f"<text x='0' y='{y + 15:.0f}' font-size='12' fill='#123047'>{html_lib.escape(label[:20])}</text>"
+            f"<rect x='{x:.0f}' y='{y:.0f}' width='{w:.0f}' height='20' rx='4' fill='{color}'/>"
+            f"<text x='{(x - 5) if value < 0 else (x + w + 5):.0f}' y='{y + 15:.0f}' font-size='11' "
+            f"fill='#456257' text-anchor='{'end' if value < 0 else 'start'}'>{vtxt}</text>"
+        )
+    return f"<svg viewBox='0 0 {width} {height}' width='100%' style='max-width:480px'>" + "".join(rows) + "</svg>"
 
 
-def _base_dashboard_frame(df: pd.DataFrame) -> pd.DataFrame:
-    output = pd.DataFrame(index=df.index)
-    audio_col = _audio_col(df)
-    output["audio"] = (
-        df[audio_col].astype("string")
-        if audio_col
-        else pd.Series([pd.NA] * len(df), index=df.index, dtype="string")
+def _render_chart(chart: dict) -> str:
+    t = chart.get("type")
+    if t == "bars":
+        return _svg_bars(chart["items"], chart.get("unit", ""), chart.get("vmax"), chart.get("color", COLORS["teal"]))
+    if t == "donut":
+        return _svg_donut(chart.get("pct"), chart.get("label", ""), chart.get("color", COLORS["blue"]))
+    if t == "stacked":
+        return _svg_stacked(chart["items"])
+    if t == "funnel":
+        return _svg_funnel(chart["items"])
+    if t == "diverging":
+        return _svg_diverging(chart["items"])
+    return ""
+
+
+# ============================================================
+# RENDER DEL DASHBOARD (pestañas + filtro de corpus)
+# ============================================================
+
+PHASE_TABS = [
+    ("00", "00 · Limpieza"),
+    ("01", "01–04 · Diarización"),
+    ("05", "05 · Transcripción"),
+    ("06", "06 · Rol proxy"),
+    ("07A", "07A · Sentimiento"),
+    ("07B", "07B · Afecto audio"),
+    ("07C", "07C · Fusión"),
+    ("08", "08 · Keywords"),
+    ("09", "09 · Huella de voz"),
+]
+
+
+def _render_kpis(kpis) -> str:
+    cards = []
+    for label, value, kind in kpis:
+        cards.append(
+            "<div style='flex:1;min-width:140px;background:#F4FBF7;border:1px solid #CFE8DD;"
+            "border-radius:12px;padding:16px 18px;'>"
+            f"<div style='font-size:30px;font-weight:800;color:#123047;line-height:1;'>{_fmt(value, kind)}</div>"
+            f"<div style='font-size:12px;color:#456257;margin-top:6px;'>{html_lib.escape(label)}</div>"
+            "</div>"
+        )
+    return f"<div style='display:flex;flex-wrap:wrap;gap:12px;margin-bottom:16px;'>{''.join(cards)}</div>"
+
+
+def _render_phase_panel(phase_id: str, agg: dict) -> str:
+    data = agg.get(phase_id, {})
+    kpis = _render_kpis(data.get("kpis", []))
+    charts = data.get("charts")
+    if charts is None:  # compatibilidad con fases que aún usen "chart" singular
+        single = data.get("chart")
+        charts = [single] if single else []
+
+    chart_cards = []
+    for chart in charts:
+        chart_svg = _render_chart(chart) if chart else ""
+        if not chart_svg:
+            continue
+        chart_cards.append(
+            "<div style='flex:1;min-width:260px;background:#FCFEFD;border:1px solid #E4F0EA;"
+            "border-radius:12px;padding:16px 18px;'>"
+            f"<div style='font-size:11.5px;font-weight:650;color:#2A9D8F;text-transform:uppercase;"
+            f"letter-spacing:.04em;margin-bottom:10px;'>{html_lib.escape(chart.get('title', ''))}</div>"
+            f"{chart_svg}</div>"
+        )
+    chart_block = (
+        f"<div style='display:flex;flex-wrap:wrap;gap:14px;'>{''.join(chart_cards)}</div>"
+        if chart_cards else ""
     )
-    output["corpus"] = df.get(
-        "_dashboard_corpus",
-        pd.Series(["No identificado"] * len(df), index=df.index),
-    ).astype("string")
-    output["role"] = df.get(
-        "_dashboard_role",
-        pd.Series(["Sin rol"] * len(df), index=df.index),
-    ).astype("string")
-    output["margin"] = pd.to_numeric(
-        df.get(
-            "_dashboard_margin",
-            pd.Series([np.nan] * len(df), index=df.index),
-        ),
-        errors="coerce",
-    )
-    anchor_values = df.get(
-        "_dashboard_anchor",
-        pd.Series([pd.NA] * len(df), index=df.index),
-    )
-    output["anchor"] = anchor_values.astype("boolean")
-    return output
+    return kpis + chart_block
 
 
-def _clean_records(df: pd.DataFrame, max_rows: int | None = None) -> list[dict[str, Any]]:
-    if df.empty:
-        return []
-
-    output = df.copy()
-    if max_rows is not None and len(output) > max_rows:
-        output = output.sample(n=max_rows, random_state=42)
-
-    output = output.replace({np.inf: np.nan, -np.inf: np.nan})
-    output = output.astype(object).where(pd.notna(output), None)
-    return output.to_dict(orient="records")
-
-
-def _build_final_segment_records(df: pd.DataFrame) -> list[dict[str, Any]]:
-    if df.empty:
-        return []
-    output = _base_dashboard_frame(df)
-    start = _numeric_series(df, ["start", "segment_start", "start_sec"])
-    end = _numeric_series(df, ["end", "segment_end", "end_sec"])
-    duration = _numeric_series(df, ["duration", "duration_sec", "segment_duration"])
-    duration = duration.where(duration.notna(), end - start)
-    output["start"] = start
-    output["end"] = end
-    output["duration"] = duration
-    output["overlap"] = _numeric_series(df, ["overlap_ratio", "overlap"])
-    output["speaker"] = _series_from_candidates(
-        df,
-        ["speaker_final", "speaker", "speaker_original", "label"],
-        "Sin speaker",
-    ).astype("string")
-    output["speaker_original"] = _series_from_candidates(
-        df,
-        ["speaker_original", "speaker", "label"],
-        "",
-    ).astype("string")
-    output["changed"] = _boolean_series(
-        df,
-        ["was_reclassified", "was_relabelled", "changed"],
-    )
-    return _clean_records(output)
-
-
-def _build_scored_records(df: pd.DataFrame) -> list[dict[str, Any]]:
-    if df.empty:
-        return []
-    output = _base_dashboard_frame(df)
-    output["overlap"] = _numeric_series(df, ["overlap_ratio", "overlap"])
-    output["speaker"] = _series_from_candidates(
-        df,
-        ["speaker_final", "speaker", "speaker_original", "label"],
-        "Sin speaker",
-    ).astype("string")
-    return _clean_records(output)
-
-
-def _build_anchor_records(df: pd.DataFrame) -> list[dict[str, Any]]:
-    if df.empty:
-        return []
-    output = _base_dashboard_frame(df)
-    output["anchor"] = True
-    output["speaker"] = _series_from_candidates(
-        df,
-        ["speaker_final", "speaker", "speaker_original", "label"],
-        "Sin speaker",
-    ).astype("string")
-    return _clean_records(output)
-
-
-def _build_audio_records(df: pd.DataFrame) -> list[dict[str, Any]]:
-    if df.empty:
-        return []
-    output = _base_dashboard_frame(df)
-    output["before_sec"] = _numeric_series(
-        df,
-        [
-            "duration_before_sec",
-            "original_duration_sec",
-            "duration_original_sec",
-            "raw_duration_sec",
-            "duration_before",
-        ],
-    )
-    output["after_sec"] = _numeric_series(
-        df,
-        [
-            "duration_after_sec",
-            "clean_duration_sec",
-            "duration_clean_sec",
-            "processed_duration_sec",
-            "duration_after",
-        ],
-    )
-    return _clean_records(output)
-
-
-def _build_transcription_records(df: pd.DataFrame) -> list[dict[str, Any]]:
-    if df.empty:
-        return []
-    output = _base_dashboard_frame(df)
-    text_col = _text_col(df)
-    text = (
-        df[text_col].fillna("").astype(str)
-        if text_col
-        else pd.Series([""] * len(df), index=df.index)
-    )
-    output["has_text"] = text.str.strip().ne("")
-    output["word_count"] = text.str.split().str.len().fillna(0).astype(int)
-    output["text"] = text.str.slice(0, 180)
-    output["start"] = _numeric_series(df, ["start", "segment_start", "start_sec"])
-    output["end"] = _numeric_series(df, ["end", "segment_end", "end_sec"])
-    output["speaker"] = _series_from_candidates(
-        df,
-        ["speaker_final", "speaker", "speaker_original", "label"],
-        "",
-    ).astype("string")
-    output["status"] = _series_from_candidates(
-        df,
-        ["transcription_status", "status", "alignment_status"],
-        "",
-    ).astype("string")
-    return _clean_records(output, max_rows=60000)
-
-
-def _build_mapping_records(df: pd.DataFrame) -> list[dict[str, Any]]:
-    if df.empty:
-        return []
-    output = _base_dashboard_frame(df)
-    output["status"] = _series_from_candidates(
-        df,
-        ["role_mapping_status", "mapping_status", "status"],
-        "Sin estado",
-    ).fillna("Sin estado").astype("string")
-    return _clean_records(output)
-
-
-def _build_sentiment_records(df: pd.DataFrame) -> list[dict[str, Any]]:
-    if df.empty:
-        return []
-    output = _base_dashboard_frame(df)
-    output["sentiment"] = _series_from_candidates(
-        df,
-        [
-            "sentiment_label",
-            "sentiment",
-            "label_sentiment",
-            "sentiment_category",
-            "sentiment_textual",
-        ],
-        "Sin etiqueta",
-    ).fillna("Sin etiqueta").astype("string")
-    text_col = _text_col(df)
-    if text_col:
-        output["text"] = df[text_col].fillna("").astype(str).str.slice(0, 180)
-    else:
-        output["text"] = ""
-    return _clean_records(output, max_rows=60000)
-
-
-def _build_prosody_records(df: pd.DataFrame) -> list[dict[str, Any]]:
-    if df.empty:
-        return []
-    output = _base_dashboard_frame(df)
-    output["prosody"] = _series_from_candidates(
-        df,
-        [
-            "prosodic_state",
-            "audio_affect_label",
-            "audio_emotion",
-            "ser_label",
-            "emotion_label",
-            "predicted_emotion",
-            "affective_state",
-        ],
-        "Sin etiqueta",
-    ).fillna("Sin etiqueta").astype("string")
-    output["arousal"] = _numeric_series(
-        df,
-        ["arousal", "arousal_score", "mean_arousal"],
-    )
-    output["tension"] = _numeric_series(
-        df,
-        ["tension", "tension_score", "mean_tension"],
-    )
-    return _clean_records(output, max_rows=60000)
-
-
-def _build_fusion_records(df: pd.DataFrame) -> list[dict[str, Any]]:
-    if df.empty:
-        return []
-    output = _base_dashboard_frame(df)
-    output["sentiment"] = _series_from_candidates(
-        df,
-        [
-            "sentiment_label",
-            "sentiment",
-            "text_sentiment_label",
-            "sentiment_textual",
-            "textual_sentiment",
-        ],
-        "Sin etiqueta",
-    ).fillna("Sin etiqueta").astype("string")
-    output["prosody"] = _series_from_candidates(
-        df,
-        [
-            "prosodic_state",
-            "audio_affect_label",
-            "audio_emotion",
-            "ser_label",
-            "emotion_label",
-            "predicted_emotion",
-        ],
-        "Sin etiqueta",
-    ).fillna("Sin etiqueta").astype("string")
-    output["disagreement"] = _boolean_series(
-        df,
-        [
-            "is_disagreement",
-            "disagreement_flag",
-            "masked_frustration_flag",
-            "audio_text_disagreement",
-        ],
-    )
-    text_col = _text_col(df)
-    output["text"] = (
-        df[text_col].fillna("").astype(str).str.slice(0, 180)
-        if text_col
-        else ""
-    )
-    return _clean_records(output, max_rows=60000)
-
-
-def _keyword_count_columns(df: pd.DataFrame) -> list[str]:
-    return [
-        str(column)
-        for column in df.columns
-        if str(column).lower().endswith("_count")
-        and str(column).lower()
-        not in {"keyword_total_count", "total_keyword_count"}
-    ]
-
-
-def _build_keyword_records(df: pd.DataFrame) -> list[dict[str, Any]]:
-    if df.empty:
-        return []
-    output = _base_dashboard_frame(df)
-    output["criticality"] = _numeric_series(
-        df,
-        ["criticality_score", "critical_score", "risk_score"],
-    )
-    output["critical"] = _boolean_series(
-        df,
-        ["has_critical_keyword", "has_keyword", "critical_keyword_flag"],
-    )
-    output["keyword_total"] = _numeric_series(
-        df,
-        ["keyword_total_count", "total_keyword_count", "n_keywords"],
-    )
-    output["category"] = _series_from_candidates(
-        df,
-        ["keyword", "keyword_category", "topic", "theme", "tema"],
-        "",
-    ).astype("string")
-    text_col = _text_col(df)
-    output["text"] = (
-        df[text_col].fillna("").astype(str).str.slice(0, 180)
-        if text_col
-        else ""
+def _render_corpus_version(corpus_key: str, agg: dict) -> str:
+    """Renderiza todas las pestañas para un corpus dado (oculto salvo el activo)."""
+    panels = []
+    for pid, _label in PHASE_TABS:
+        panels.append(
+            f"<div class='tfm-panel' data-phase='{pid}'>{_render_phase_panel(pid, agg)}</div>"
+        )
+    return (
+        f"<div class='tfm-corpus' data-corpus='{corpus_key}' style='display:none;'>"
+        + "".join(panels) + "</div>"
     )
 
-    count_columns = _keyword_count_columns(df)
-    for column in count_columns[:30]:
-        output[column] = pd.to_numeric(df[column], errors="coerce").fillna(0)
 
-    return _clean_records(output, max_rows=60000)
+def build_html(aggregates_by_corpus: dict[str, dict], availability: pd.DataFrame) -> str:
+    """Ensambla el HTML autónomo y ligero con pestañas y filtro de corpus."""
+    n_avail = int(availability["available"].sum()) if not availability.empty else 0
+    n_total = len(availability) if not availability.empty else 0
+    generated = datetime.now().strftime("%d/%m/%Y %H:%M")
 
-
-def _build_voiceprint_pair_records(df: pd.DataFrame) -> list[dict[str, Any]]:
-    if df.empty:
-        return []
-    output = _base_dashboard_frame(df)
-    output["score"] = _numeric_series(
-        df,
-        [
-            "similarity_score",
-            "cosine_similarity",
-            "verification_score",
-            "best_similarity",
-            "top1_score",
-            "score",
-        ],
+    tabs = "".join(
+        f"<button class='tfm-tab' data-phase='{pid}'>{html_lib.escape(label)}</button>"
+        for pid, label in PHASE_TABS
     )
-    output["same"] = _boolean_series(
-        df,
-        ["is_same_identity", "same_identity", "true_match", "target", "label"],
+    corpus_versions = "".join(
+        _render_corpus_version(ckey, agg) for ckey, agg in aggregates_by_corpus.items()
     )
-    return _clean_records(output, max_rows=100000)
-
-
-def _build_voiceprint_prediction_records(df: pd.DataFrame) -> list[dict[str, Any]]:
-    if df.empty:
-        return []
-    output = _base_dashboard_frame(df)
-    output["decision"] = _series_from_candidates(
-        df,
-        ["decision", "prediction", "open_set_decision", "predicted_status"],
-        "Sin decisión",
-    ).fillna("Sin decisión").astype("string")
-    output["correct"] = _boolean_series(
-        df,
-        ["identification_correct", "correct", "is_correct"],
+    corpus_options = "".join(
+        f"<option value='{c}'>{c}</option>" for c in ["Todos", "Bajas", "Comerciales"]
     )
-    output["true_enrolled"] = _boolean_series(
-        df,
-        ["true_is_enrolled", "is_enrolled", "known_identity"],
-    )
-    output["score"] = _numeric_series(
-        df,
-        ["best_similarity", "top1_score", "similarity_score", "score"],
-    )
-    output["predicted_id"] = _series_from_candidates(
-        df,
-        ["predicted_person_id", "predicted_identity", "predicted_id"],
-        "",
-    ).astype("string")
-    output["true_id"] = _series_from_candidates(
-        df,
-        ["true_person_id", "true_identity", "person_id"],
-        "",
-    ).astype("string")
-    return _clean_records(output, max_rows=60000)
 
-
-def _small_table_payload(df: pd.DataFrame, max_rows: int = 250) -> list[dict[str, Any]]:
-    if df.empty:
-        return []
-    selected = df.head(max_rows).copy()
-    selected = selected.replace({np.inf: np.nan, -np.inf: np.nan})
-    selected = selected.astype(object).where(pd.notna(selected), None)
-    return selected.to_dict(orient="records")
-
-
-def _build_dashboard_payload(
-    datasets: dict[str, pd.DataFrame],
-    availability: pd.DataFrame,
-) -> dict[str, Any]:
-    keyword_source = datasets.get("keyword_sentiment_calls", pd.DataFrame())
-    if keyword_source.empty:
-        keyword_source = datasets.get("keyword_calls", pd.DataFrame())
-
-    payload = {
-        "generated_at": datetime.now().strftime("%d/%m/%Y %H:%M"),
-        "margin_range": list(_global_margin_range(datasets)),
-        "roles": _global_roles(datasets),
-        "availability": _small_table_payload(
-            availability[
-                ["phase", "dataset", "available", "downloaded", "error"]
-            ].copy(),
-            max_rows=500,
-        ),
-        "audio_inventory": _build_audio_records(
-            datasets.get("audio_inventory", pd.DataFrame())
-        ),
-        "cleaning_results": _build_audio_records(
-            datasets.get("cleaning_results", pd.DataFrame())
-        ),
-        "diarization_summary": _build_audio_records(
-            datasets.get("diarization_summary", pd.DataFrame())
-        ),
-        "final_segments": _build_final_segment_records(
-            datasets.get("final_segments", pd.DataFrame())
-        ),
-        "scored_segments": _build_scored_records(
-            datasets.get("scored_segments", pd.DataFrame())
-        ),
-        "anchor_segments": _build_anchor_records(
-            datasets.get("anchor_segments", pd.DataFrame())
-        ),
-        "transcribed_segments": _build_transcription_records(
-            datasets.get("transcribed_segments", pd.DataFrame())
-        ),
-        "segment_proxy": _build_transcription_records(
-            datasets.get("segment_proxy", pd.DataFrame())
-        ),
-        "speaker_role_mapping": _build_mapping_records(
-            datasets.get("speaker_role_mapping", pd.DataFrame())
-        ),
-        "text_sentiment": _build_sentiment_records(
-            datasets.get("text_sentiment_segments", pd.DataFrame())
-        ),
-        "prosody": _build_prosody_records(
-            datasets.get("prosody_segments", pd.DataFrame())
-        ),
-        "fusion": _build_fusion_records(
-            datasets.get("fusion_segments", pd.DataFrame())
-        ),
-        "keyword_segments": _build_keyword_records(
-            datasets.get("keyword_segments", pd.DataFrame())
-        ),
-        "keyword_calls": _build_keyword_records(keyword_source),
-        "critical_calls": _build_keyword_records(
-            datasets.get("critical_calls", pd.DataFrame())
-        ),
-        "voiceprint_pairs": _build_voiceprint_pair_records(
-            datasets.get("voiceprint_pairwise_scores", pd.DataFrame())
-        ),
-        "voiceprint_predictions": _build_voiceprint_prediction_records(
-            datasets.get("voiceprint_predictions", pd.DataFrame())
-        ),
-        "voiceprint_confusion": _small_table_payload(
-            datasets.get("voiceprint_confusion", pd.DataFrame()),
-            max_rows=100,
-        ),
-        "voiceprint_metrics": _small_table_payload(
-            datasets.get("voiceprint_verification_metrics", pd.DataFrame()),
-            max_rows=200,
-        ),
-        "voiceprint_summary": _small_table_payload(
-            datasets.get("voiceprint_open_set_summary", pd.DataFrame()),
-            max_rows=200,
-        ),
-    }
-    return payload
-
-
-DASHBOARD_CSS = r"""
-:root {
-  --navy:#123047; --blue:#2F6BFF; --green:#2A9D6F; --orange:#F28E2B;
-  --red:#D1495B; --purple:#7B61A8; --gray:#6F7C85; --line:#DDE5EA;
-  --light:#F4F7FA; --white:#FFFFFF;
-}
-* { box-sizing:border-box; }
-body { margin:0; background:#EEF3F6; color:#263843; font-family:Inter,Arial,sans-serif; }
-.tfm-page { width:min(1500px,97vw); margin:18px auto 40px; }
-.tfm-header { background:linear-gradient(135deg,var(--navy),var(--blue)); color:white;
-  border-radius:16px; padding:22px 26px; box-shadow:0 8px 24px rgba(18,48,71,.16); }
-.tfm-title { font-size:27px; font-weight:760; }
-.tfm-subtitle { opacity:.92; font-size:13px; margin-top:5px; }
-.tfm-toolbar { display:grid; grid-template-columns:repeat(4,minmax(170px,1fr)); gap:10px;
-  background:white; border:1px solid var(--line); border-radius:14px; padding:13px;
-  margin:12px 0; position:sticky; top:5px; z-index:20; box-shadow:0 3px 12px rgba(18,48,71,.08); }
-.tfm-control label { display:block; font-size:11px; font-weight:700; color:#5F6D77; margin-bottom:4px; }
-.tfm-control select,.tfm-control input { width:100%; border:1px solid #CBD6DD; border-radius:8px;
-  padding:8px 9px; background:white; color:#243845; }
-.tfm-range-values { display:flex; gap:8px; font-size:11px; color:#5F6D77; margin-top:4px; }
-.tfm-actions { grid-column:1/-1; display:flex; gap:9px; flex-wrap:wrap; align-items:center; }
-.tfm-btn { border:0; border-radius:8px; padding:9px 14px; font-weight:700; cursor:pointer; }
-.tfm-btn.primary { background:var(--blue); color:white; }
-.tfm-btn.secondary { background:#E9EFF3; color:var(--navy); }
-.tfm-btn.export { background:var(--green); color:white; margin-left:auto; }
-.tfm-note { background:#F4F7FA; border-left:4px solid var(--blue); border-radius:8px;
-  padding:10px 12px; margin:10px 0; font-size:12px; color:#4B5A64; }
-.tfm-tabs { display:flex; flex-wrap:wrap; gap:7px; margin:12px 0 8px; }
-.tfm-tab { border:1px solid var(--line); background:white; color:var(--navy); border-radius:9px;
-  padding:9px 13px; font-weight:700; cursor:pointer; }
-.tfm-tab.active { background:var(--navy); color:white; border-color:var(--navy); }
-.tfm-panel { display:none; background:white; border:1px solid var(--line); border-radius:14px;
-  padding:17px; min-height:340px; box-shadow:0 4px 16px rgba(18,48,71,.06); }
-.tfm-panel.active { display:block; }
-.tfm-kpis { display:grid; grid-template-columns:repeat(4,minmax(150px,1fr)); gap:10px; margin-bottom:12px; }
-.tfm-kpi { border:1px solid var(--line); background:#FBFCFD; border-radius:11px; padding:12px; }
-.tfm-kpi .value { color:var(--navy); font-size:22px; font-weight:760; }
-.tfm-kpi .label { color:#66747D; font-size:11px; margin-top:4px; }
-.tfm-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
-.tfm-card { border:1px solid var(--line); border-radius:12px; padding:9px; background:white; min-height:320px; }
-.tfm-card.full { grid-column:1/-1; }
-.tfm-chart { width:100%; height:360px; }
-.tfm-section-title { font-size:17px; font-weight:750; color:var(--navy); margin:4px 0 9px; }
-.tfm-table-wrap { max-height:390px; overflow:auto; border:1px solid var(--line); border-radius:10px; }
-table { width:100%; border-collapse:collapse; font-size:11px; }
-th { position:sticky; top:0; background:#EDF3F7; color:var(--navy); text-align:left; z-index:1; }
-th,td { padding:7px 8px; border-bottom:1px solid #E8EDF0; vertical-align:top; }
-tr:nth-child(even) td { background:#FBFCFD; }
-.tfm-empty { min-height:260px; display:flex; align-items:center; justify-content:center;
-  color:#71808A; background:#F8FAFB; border-radius:9px; text-align:center; padding:20px; }
-.tfm-filter-summary { font-size:12px; color:#52616B; margin-left:auto; }
-@media(max-width:900px){ .tfm-toolbar{grid-template-columns:1fr 1fr}.tfm-grid{grid-template-columns:1fr}.tfm-kpis{grid-template-columns:1fr 1fr}.tfm-card.full{grid-column:auto} }
-"""
-
-
-DASHBOARD_JS = r"""
-(function(){
-const DATA = window.__TFM_DASHBOARD_DATA__;
-const COLORS = {blue:'#2F6BFF',navy:'#123047',orange:'#F28E2B',green:'#2A9D6F',red:'#D1495B',purple:'#7B61A8',gray:'#7A8288'};
-const cfg = {responsive:true,displaylogo:false,modeBarButtonsToRemove:['lasso2d','select2d']};
-const $ = (id) => document.getElementById(id);
-const esc = (value) => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
-const num = (value) => { const x=Number(value); return Number.isFinite(x)?x:null; };
-const fmtInt = (value) => Number(value||0).toLocaleString('es-ES');
-const fmtPct = (value) => Number.isFinite(value) ? (100*value).toFixed(1).replace('.',',')+' %' : 'N/D';
-const uniqueAudio = (rows) => new Set(rows.map(r=>r.audio).filter(Boolean)).size;
-const countBy = (rows,key) => { const out={}; rows.forEach(r=>{ const k=String(r[key]??'Sin dato'); out[k]=(out[k]||0)+1; }); return out; };
-const sum = (rows,key) => rows.reduce((a,r)=>a+(num(r[key])||0),0);
-const truthy = (v) => v===true || ['true','1','yes','si','sí'].includes(String(v).toLowerCase());
-
-function currentFilters(){
-  return {
-    corpus:$('filter-corpus').value,
-    role:$('filter-role').value,
-    marginMin:Math.min(Number($('filter-margin-min').value),Number($('filter-margin-max').value)),
-    marginMax:Math.max(Number($('filter-margin-min').value),Number($('filter-margin-max').value)),
-    anchor:$('filter-anchor').value
-  };
-}
-function filtered(rows){
-  const f=currentFilters();
-  return (rows||[]).filter(r=>{
-    if(f.corpus!=='Todos' && String(r.corpus)!==f.corpus) return false;
-    if(f.role!=='Todos' && String(r.role)!==f.role) return false;
-    const m=num(r.margin); if(m!==null && (m<f.marginMin || m>f.marginMax)) return false;
-    if(f.anchor!=='Todos' && r.anchor!==null && r.anchor!==undefined){
-      const wanted=f.anchor==='Solo anchors'; if(truthy(r.anchor)!==wanted) return false;
-    }
-    return true;
-  });
-}
-function kpis(containerId,items){
-  $(containerId).innerHTML=items.map(x=>`<div class="tfm-kpi"><div class="value">${esc(x[1])}</div><div class="label">${esc(x[0])}</div></div>`).join('');
-}
-function emptyPlot(id,message){ $(id).innerHTML=`<div class="tfm-empty">${esc(message)}</div>`; }
-function bar(id,counts,title,color=COLORS.blue,horizontal=false){
-  const entries=Object.entries(counts).sort((a,b)=>b[1]-a[1]);
-  if(!entries.length){emptyPlot(id,'No hay datos disponibles para esta vista.');return;}
-  const labels=entries.map(x=>x[0]), values=entries.map(x=>x[1]);
-  const trace=horizontal?{type:'bar',x:values,y:labels,orientation:'h',marker:{color},text:values,textposition:'auto'}:{type:'bar',x:labels,y:values,marker:{color},text:values,textposition:'auto'};
-  Plotly.react(id,[trace],{title:{text:title,font:{size:16}},margin:{l:horizontal?150:55,r:20,t:50,b:70},paper_bgcolor:'white',plot_bgcolor:'white'},cfg);
-}
-function histogram(id,values,title,color=COLORS.blue,groups=null){
-  const clean=values.map(num).filter(v=>v!==null);
-  if(!clean.length){emptyPlot(id,'No hay valores numéricos disponibles.');return;}
-  let traces;
-  if(groups){
-    const grouped={}; values.forEach((v,i)=>{const n=num(v);if(n===null)return;const g=String(groups[i]??'Sin grupo');(grouped[g]??=[]).push(n);});
-    traces=Object.entries(grouped).map(([name,x],i)=>({type:'histogram',x,name,opacity:.68,nbinsx:40}));
-  } else traces=[{type:'histogram',x:clean,marker:{color},nbinsx:40}];
-  Plotly.react(id,traces,{barmode:'overlay',title:{text:title,font:{size:16}},margin:{l:55,r:20,t:50,b:55},paper_bgcolor:'white',plot_bgcolor:'white'},cfg);
-}
-function table(containerId,rows,columns,maxRows=100){
-  const root=$(containerId); if(!rows.length){root.innerHTML='<div class="tfm-empty">No hay filas para los filtros actuales.</div>';return;}
-  const cols=columns.filter(c=>rows.some(r=>r[c]!==undefined && r[c]!==null && String(r[c])!==''));
-  const body=rows.slice(0,maxRows).map(r=>'<tr>'+cols.map(c=>`<td>${esc(r[c])}</td>`).join('')+'</tr>').join('');
-  root.innerHTML=`<div class="tfm-table-wrap"><table><thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>${body}</tbody></table></div>`;
-}
-function heatmap(id,rows,xKey,yKey,title){
-  const xVals=[...new Set(rows.map(r=>String(r[xKey]??'Sin dato')))];
-  const yVals=[...new Set(rows.map(r=>String(r[yKey]??'Sin dato')))];
-  if(!xVals.length || !yVals.length){emptyPlot(id,'No hay datos suficientes para la matriz.');return;}
-  const z=yVals.map(y=>xVals.map(x=>rows.filter(r=>String(r[xKey]??'Sin dato')===x && String(r[yKey]??'Sin dato')===y).length));
-  Plotly.react(id,[{type:'heatmap',x:xVals,y:yVals,z,colorscale:'Blues',text:z,texttemplate:'%{text}'}],{title:{text:title,font:{size:16}},margin:{l:110,r:20,t:50,b:80}},cfg);
-}
-function renderSummary(){
-  const inv=filtered(DATA.audio_inventory), clean=filtered(DATA.cleaning_results), final=filtered(DATA.final_segments), trans=filtered(DATA.transcribed_segments), proxy=filtered(DATA.segment_proxy), kw=filtered(DATA.keyword_calls), vp=filtered(DATA.voiceprint_predictions);
-  const withText=trans.filter(r=>truthy(r.has_text)).length;
-  const vpEvaluable=vp.filter(r=>r.correct!==null && r.correct!==undefined);
-  const vpCorrect=vpEvaluable.length?vpEvaluable.filter(r=>truthy(r.correct)).length/vpEvaluable.length:NaN;
-  kpis('summary-kpis',[
-    ['Audios inventariados',fmtInt(uniqueAudio(inv))],
-    ['Horas antes / después',(sum(clean,'before_sec')/3600).toFixed(1).replace('.',',')+' / '+(sum(clean,'after_sec')/3600).toFixed(1).replace('.',',')],
-    ['Segmentos finales',fmtInt(final.length)],
-    ['Cobertura de transcripción',fmtPct(trans.length?withText/trans.length:NaN)],
-    ['Segmentos con rol proxy',fmtInt(proxy.filter(r=>r.role && r.role!=='Sin rol').length)],
-    ['Llamadas con keywords',fmtInt(uniqueAudio(kw))],
-    ['Consultas huella de voz',fmtInt(vp.length)],
-    ['Exactitud open-set',fmtPct(vpCorrect)]
-  ]);
-  const stages=['Inventario','Diarización final','Transcripción','Roles proxy','Keywords'];
-  const vals=[uniqueAudio(inv),uniqueAudio(final),uniqueAudio(trans),uniqueAudio(proxy),uniqueAudio(kw)];
-  Plotly.react('summary-funnel',[{type:'funnel',y:stages,x:vals,textinfo:'value+percent initial',marker:{color:[COLORS.navy,COLORS.blue,COLORS.green,COLORS.orange,COLORS.purple]}}],{title:{text:'Cobertura acumulada del pipeline',font:{size:16}},margin:{l:120,r:20,t:50,b:40}},cfg);
-  const available=DATA.availability.filter(r=>truthy(r.available)).length;
-  const total=DATA.availability.length;
-  bar('summary-availability',{'Disponibles':available,'No disponibles':Math.max(total-available,0)},'Disponibilidad de outputs',COLORS.green);
-  table('summary-table',DATA.availability,['phase','dataset','available','downloaded','error'],200);
-}
-function renderDiarization(){
-  const final=filtered(DATA.final_segments), scored=filtered(DATA.scored_segments), anchors=filtered(DATA.anchor_segments);
-  kpis('diarization-kpis',[
-    ['Segmentos puntuados',fmtInt(scored.length)],['Anchors',fmtInt(anchors.length)],['Segmentos finales',fmtInt(final.length)],['Reetiquetados',fmtInt(final.filter(r=>truthy(r.changed)).length)]
-  ]);
-  histogram('margin-hist',final.map(r=>r.margin),'Distribución del margen de reetiquetado',COLORS.blue,final.map(r=>truthy(r.changed)?'Reetiquetado':'Sin cambio'));
-  histogram('overlap-hist',scored.map(r=>r.overlap),'Distribución del solapamiento',COLORS.orange);
-  bar('anchor-bar',countBy(anchors,'speaker'),'Anchors por speaker',COLORS.green);
-  histogram('duration-hist',final.map(r=>r.duration),'Duración de segmentos finales',COLORS.purple);
-  table('diarization-table',final,['audio','start','end','duration','speaker_original','speaker','changed','margin','anchor'],120);
-}
-function renderTranscription(){
-  const trans=filtered(DATA.transcribed_segments), proxy=filtered(DATA.segment_proxy), mappings=filtered(DATA.speaker_role_mapping);
-  const withText=trans.filter(r=>truthy(r.has_text));
-  kpis('transcription-kpis',[
-    ['Segmentos transcritos',fmtInt(trans.length)],['Con texto',fmtInt(withText.length)],['Con rol proxy',fmtInt(proxy.filter(r=>r.role && r.role!=='Sin rol').length)],['Mappings speaker→rol',fmtInt(mappings.length)]
-  ]);
-  bar('coverage-bar',{'Con texto':withText.length,'Sin texto':trans.length-withText.length},'Cobertura de transcripción',COLORS.green);
-  histogram('words-hist',withText.map(r=>r.word_count),'Longitud textual por segmento',COLORS.blue);
-  bar('roles-bar',countBy(proxy,'role'),'Distribución de roles',COLORS.orange);
-  bar('mapping-bar',countBy(mappings,'status'),'Estado del mapping speaker → rol',COLORS.purple,true);
-  table('transcription-table',proxy.length?proxy:trans,['audio','start','end','speaker','role','status','text'],120);
-}
-function renderSentiment(){
-  const text=filtered(DATA.text_sentiment), prosody=filtered(DATA.prosody), fusion=filtered(DATA.fusion);
-  kpis('sentiment-kpis',[
-    ['Segmentos con sentimiento textual',fmtInt(text.length)],['Segmentos con afecto acústico',fmtInt(prosody.length)],['Segmentos fusionados',fmtInt(fusion.length)],['Desacuerdos detectados',fmtInt(fusion.filter(r=>truthy(r.disagreement)).length)]
-  ]);
-  bar('text-sentiment-bar',countBy(text,'sentiment'),'Sentimiento textual',COLORS.blue);
-  bar('prosody-bar',countBy(prosody,'prosody'),'Estado afectivo acústico',COLORS.orange);
-  heatmap('fusion-heatmap',fusion,'sentiment','prosody','Relación audio–texto');
-  const disagreements=fusion.filter(r=>truthy(r.disagreement));
-  table('sentiment-table',disagreements.length?disagreements:fusion,['audio','role','sentiment','prosody','disagreement','text'],120);
-}
-function renderKeywords(){
-  const seg=filtered(DATA.keyword_segments), calls=filtered(DATA.keyword_calls), critical=filtered(DATA.critical_calls);
-  const segCriticalKnown=seg.filter(r=>r.critical!==null && r.critical!==undefined);
-  const totals={}; calls.forEach(r=>Object.keys(r).filter(k=>k.endsWith('_count') && !['keyword_total_count','total_keyword_count'].includes(k)).forEach(k=>{totals[k]=(totals[k]||0)+(num(r[k])||0);}));
-  const labels={}; Object.entries(totals).forEach(([k,v])=>{labels[k.replace(/^kw_/,'').replace(/_count$/,'').replaceAll('_',' ')]=v;});
-  kpis('keyword-kpis',[
-    ['Segmentos analizados',fmtInt(seg.length)],['Llamadas analizadas',fmtInt(calls.length)],['Llamadas priorizadas',fmtInt(critical.length)],['Categorías detectadas',fmtInt(Object.keys(labels).length)]
-  ]);
-  bar('keywords-bar',labels,'Keywords o temas más frecuentes',COLORS.orange,true);
-  histogram('criticality-hist',calls.map(r=>r.criticality),'Criticidad por llamada',COLORS.red);
-  bar('critical-coverage',{'Con keyword crítica':segCriticalKnown.filter(r=>truthy(r.critical)).length,'Sin keyword crítica':segCriticalKnown.filter(r=>!truthy(r.critical)).length},'Cobertura de keywords críticas',COLORS.red);
-  const tableRows=(critical.length?critical:calls).slice().sort((a,b)=>(num(b.criticality)||0)-(num(a.criticality)||0));
-  table('keyword-table',tableRows,['audio','role','criticality','keyword_total','critical','category','text'],120);
-}
-function renderVoiceprint(){
-  const pairs=filtered(DATA.voiceprint_pairs), pred=filtered(DATA.voiceprint_predictions);
-  const labelledPairs=pairs.filter(r=>r.same!==null && r.same!==undefined);
-  const same=labelledPairs.filter(r=>truthy(r.same)), diff=labelledPairs.filter(r=>!truthy(r.same));
-  kpis('voiceprint-kpis',[
-    ['Pares evaluados',fmtInt(pairs.length)],['Misma identidad',fmtInt(same.length)],['Consultas open-set',fmtInt(pred.length)],['Predicciones correctas',fmtInt(pred.filter(r=>truthy(r.correct)).length)]
-  ]);
-  if(pairs.some(r=>num(r.score)!==null)){
-    Plotly.react('voice-score-hist',[
-      {type:'histogram',x:same.map(r=>num(r.score)).filter(v=>v!==null),name:'Misma identidad',opacity:.68,nbinsx:45},
-      {type:'histogram',x:diff.map(r=>num(r.score)).filter(v=>v!==null),name:'Identidad distinta',opacity:.68,nbinsx:45}
-    ],{barmode:'overlay',title:{text:'Distribución de scores de similitud vocal',font:{size:16}},margin:{l:55,r:20,t:50,b:55}},cfg);
-  } else emptyPlot('voice-score-hist','No hay scores de similitud disponibles.');
-  bar('voice-decision-bar',countBy(pred,'decision'),'Decisiones open-set',COLORS.purple);
-  const conf=DATA.voiceprint_confusion;
-  if(conf.length){
-    const labelKey=Object.keys(conf[0]).find(k=>typeof conf[0][k]==='string') || Object.keys(conf[0])[0];
-    const cols=Object.keys(conf[0]).filter(k=>k!==labelKey);
-    const z=conf.map(r=>cols.map(c=>num(r[c])||0));
-    Plotly.react('voice-confusion',[{type:'heatmap',x:cols,y:conf.map(r=>String(r[labelKey])),z,colorscale:'Blues',text:z,texttemplate:'%{text}'}],{title:{text:'Matriz de decisiones open-set',font:{size:16}},margin:{l:90,r:20,t:50,b:70}},cfg);
-  } else emptyPlot('voice-confusion','No se encontró la matriz open-set.');
-  table('voice-metrics',[...DATA.voiceprint_metrics,...DATA.voiceprint_summary],Object.keys((DATA.voiceprint_metrics[0]||DATA.voiceprint_summary[0]||{})),200);
-  table('voice-table',pred,['audio','decision','correct','true_enrolled','score','predicted_id','true_id'],120);
-}
-function renderAll(){
-  const f=currentFilters();
-  $('margin-min-value').textContent=f.marginMin.toFixed(4);
-  $('margin-max-value').textContent=f.marginMax.toFixed(4);
-  $('filter-summary').textContent=`Corpus: ${f.corpus} · Rol: ${f.role} · Margen: ${f.marginMin.toFixed(4)}–${f.marginMax.toFixed(4)} · Anchors: ${f.anchor}`;
-  renderSummary();renderDiarization();renderTranscription();renderSentiment();renderKeywords();renderVoiceprint();
-  setTimeout(()=>document.querySelectorAll('.tfm-panel.active .tfm-chart').forEach(el=>{try{Plotly.Plots.resize(el)}catch(e){}}),80);
-}
-function resetFilters(){
-  $('filter-corpus').value='Todos'; $('filter-role').value='Todos';
-  $('filter-margin-min').value=DATA.margin_range[0]; $('filter-margin-max').value=DATA.margin_range[1];
-  $('filter-anchor').value='Todos'; renderAll();
-}
-function downloadHtml(){
-  const blob=new Blob(['<!doctype html>\n'+document.documentElement.outerHTML],{type:'text/html;charset=utf-8'});
-  const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='dashboard_resultados_globales.html';
-  document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(url),1000);
-}
-document.querySelectorAll('.tfm-tab').forEach(btn=>btn.addEventListener('click',()=>{
-  document.querySelectorAll('.tfm-tab').forEach(x=>x.classList.remove('active'));
-  document.querySelectorAll('.tfm-panel').forEach(x=>x.classList.remove('active'));
-  btn.classList.add('active'); $(btn.dataset.target).classList.add('active');
-  setTimeout(()=>document.querySelectorAll('#'+btn.dataset.target+' .tfm-chart').forEach(el=>{try{Plotly.Plots.resize(el)}catch(e){}}),80);
-}));
-$('apply-filters').addEventListener('click',renderAll); $('reset-filters').addEventListener('click',resetFilters); $('download-html').addEventListener('click',downloadHtml);
-$('filter-margin-min').addEventListener('input',()=>{$('margin-min-value').textContent=Number($('filter-margin-min').value).toFixed(4)});
-$('filter-margin-max').addEventListener('input',()=>{$('margin-max-value').textContent=Number($('filter-margin-max').value).toFixed(4)});
-renderAll();
-})();
-"""
-
-
-def _dashboard_body(payload: dict[str, Any]) -> str:
-    minimum, maximum = payload["margin_range"]
-    roles_options = "".join(
-        f"<option value='{html_lib.escape(str(role))}'>{html_lib.escape(str(role))}</option>"
-        for role in payload["roles"]
-    )
-    data_json = _json_dumps(payload).replace("</", "<\\/")
-
-    return f"""
-<div class='tfm-page'>
-  <header class='tfm-header'>
-    <div class='tfm-title'>Dashboard global de resultados del TFM</div>
-    <div class='tfm-subtitle'>Resultados agregados de limpieza, diarización, transcripción, roles, sentimiento, keywords y huella de voz · Generado {html_lib.escape(payload['generated_at'])}</div>
-  </header>
-  <div class='tfm-toolbar'>
-    <div class='tfm-control'><label>Corpus</label><select id='filter-corpus'><option>Todos</option><option>Bajas</option><option>Comerciales</option></select></div>
-    <div class='tfm-control'><label>Rol</label><select id='filter-role'>{roles_options}</select></div>
-    <div class='tfm-control'><label>Anchors</label><select id='filter-anchor'><option>Todos</option><option>Solo anchors</option><option>Excluir anchors</option></select></div>
-    <div class='tfm-control'><label>Margen mínimo</label><input id='filter-margin-min' type='range' min='{minimum}' max='{maximum}' step='{max((maximum-minimum)/100,0.001)}' value='{minimum}'><div class='tfm-range-values'><span id='margin-min-value'>{minimum:.4f}</span></div></div>
-    <div class='tfm-control'><label>Margen máximo</label><input id='filter-margin-max' type='range' min='{minimum}' max='{maximum}' step='{max((maximum-minimum)/100,0.001)}' value='{maximum}'><div class='tfm-range-values'><span id='margin-max-value'>{maximum:.4f}</span></div></div>
-    <div class='tfm-actions'>
-      <button id='apply-filters' class='tfm-btn primary'>Aplicar filtros</button>
-      <button id='reset-filters' class='tfm-btn secondary'>Restablecer filtros</button>
-      <span id='filter-summary' class='tfm-filter-summary'></span>
-      <button id='download-html' class='tfm-btn export'>Descargar HTML</button>
-    </div>
-  </div>
-  <div class='tfm-note'>Los filtros y las pestañas funcionan dentro del HTML y no dependen del kernel de Jupyter. El dashboard solo lee outputs restaurados desde GCS.</div>
-  <nav class='tfm-tabs'>
-    <button class='tfm-tab active' data-target='panel-summary'>Resumen ejecutivo</button>
-    <button class='tfm-tab' data-target='panel-diarization'>Diarización</button>
-    <button class='tfm-tab' data-target='panel-transcription'>Transcripción y roles</button>
-    <button class='tfm-tab' data-target='panel-sentiment'>Sentimiento audio-texto</button>
-    <button class='tfm-tab' data-target='panel-keywords'>Keywords</button>
-    <button class='tfm-tab' data-target='panel-voiceprint'>Huella de voz</button>
-  </nav>
-  <section id='panel-summary' class='tfm-panel active'><div id='summary-kpis' class='tfm-kpis'></div><div class='tfm-grid'><div class='tfm-card'><div id='summary-funnel' class='tfm-chart'></div></div><div class='tfm-card'><div id='summary-availability' class='tfm-chart'></div></div><div class='tfm-card full'><div class='tfm-section-title'>Cobertura de outputs</div><div id='summary-table'></div></div></div></section>
-  <section id='panel-diarization' class='tfm-panel'><div id='diarization-kpis' class='tfm-kpis'></div><div class='tfm-grid'><div class='tfm-card'><div id='margin-hist' class='tfm-chart'></div></div><div class='tfm-card'><div id='overlap-hist' class='tfm-chart'></div></div><div class='tfm-card'><div id='anchor-bar' class='tfm-chart'></div></div><div class='tfm-card'><div id='duration-hist' class='tfm-chart'></div></div><div class='tfm-card full'><div class='tfm-section-title'>Segmentos filtrados</div><div id='diarization-table'></div></div></div></section>
-  <section id='panel-transcription' class='tfm-panel'><div id='transcription-kpis' class='tfm-kpis'></div><div class='tfm-grid'><div class='tfm-card'><div id='coverage-bar' class='tfm-chart'></div></div><div class='tfm-card'><div id='words-hist' class='tfm-chart'></div></div><div class='tfm-card'><div id='roles-bar' class='tfm-chart'></div></div><div class='tfm-card'><div id='mapping-bar' class='tfm-chart'></div></div><div class='tfm-card full'><div class='tfm-section-title'>Muestra filtrada</div><div id='transcription-table'></div></div></div></section>
-  <section id='panel-sentiment' class='tfm-panel'><div id='sentiment-kpis' class='tfm-kpis'></div><div class='tfm-grid'><div class='tfm-card'><div id='text-sentiment-bar' class='tfm-chart'></div></div><div class='tfm-card'><div id='prosody-bar' class='tfm-chart'></div></div><div class='tfm-card full'><div id='fusion-heatmap' class='tfm-chart'></div></div><div class='tfm-card full'><div class='tfm-section-title'>Casos de desacuerdo o muestra fusionada</div><div id='sentiment-table'></div></div></div></section>
-  <section id='panel-keywords' class='tfm-panel'><div id='keyword-kpis' class='tfm-kpis'></div><div class='tfm-grid'><div class='tfm-card'><div id='keywords-bar' class='tfm-chart'></div></div><div class='tfm-card'><div id='criticality-hist' class='tfm-chart'></div></div><div class='tfm-card'><div id='critical-coverage' class='tfm-chart'></div></div><div class='tfm-card full'><div class='tfm-section-title'>Llamadas o segmentos priorizados</div><div id='keyword-table'></div></div></div></section>
-  <section id='panel-voiceprint' class='tfm-panel'><div id='voiceprint-kpis' class='tfm-kpis'></div><div class='tfm-grid'><div class='tfm-card'><div id='voice-score-hist' class='tfm-chart'></div></div><div class='tfm-card'><div id='voice-decision-bar' class='tfm-chart'></div></div><div class='tfm-card'><div id='voice-confusion' class='tfm-chart'></div></div><div class='tfm-card'><div class='tfm-section-title'>Métricas</div><div id='voice-metrics'></div></div><div class='tfm-card full'><div class='tfm-section-title'>Predicciones open-set</div><div id='voice-table'></div></div></div></section>
-</div>
-<script>window.__TFM_DASHBOARD_DATA__={data_json};</script>
-<script>{DASHBOARD_JS}</script>
-"""
-
-
-def _build_full_html(payload: dict[str, Any]) -> str:
-    plotly_js = get_plotlyjs()
-    body = _dashboard_body(payload)
-    return f"""<!doctype html>
-<html lang='es'>
-<head>
-  <meta charset='utf-8'>
-  <meta name='viewport' content='width=device-width,initial-scale=1'>
-  <title>Dashboard global de resultados del TFM</title>
-  <style>{DASHBOARD_CSS}</style>
-  <script>{plotly_js}</script>
-</head>
-<body>{body}</body>
-</html>"""
-
-
-def _jupyter_iframe_fragment(path: Path) -> str:
-    path = Path(path)
-    try:
-        relative = path.relative_to(PROJECT_DIR).as_posix()
-    except Exception:
-        relative = path.name
-    relative_js = relative.replace("\\", "/").replace("'", "\\'")
-    size_mb = path.stat().st_size / (1024 ** 2)
-    uid = f"tfm-global-{datetime.now().strftime('%H%M%S%f')}"
-    iframe_id = f"{uid}-frame"
-    open_id = f"{uid}-open"
-    cache = datetime.now().strftime("%Y%m%d%H%M%S%f")
-
-    return f"""
-<div id='{uid}' style='width:100%;'>
-  <div style='display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;border:1px solid #CFE8DD;background:#F4FBF7;border-radius:11px;padding:10px 13px;margin:10px 0 12px;'>
-    <div><div><b>Dashboard interactivo y HTML guardado · {size_mb:.1f} MB</b></div><div style='color:#456257;font-size:12px;overflow-wrap:anywhere;'><code>{html_lib.escape(str(path))}</code></div></div>
-    <button id='{open_id}' style='border:0;background:#2A9D6F;color:white;border-radius:7px;padding:8px 13px;font-weight:650;cursor:pointer;'>Abrir HTML en otra pestaña</button>
-  </div>
-  <iframe id='{iframe_id}' style='width:100%;height:1020px;border:1px solid #DDE5EA;border-radius:12px;background:white;' loading='eager'></iframe>
-</div>
+    script = """
 <script>
-(function(){{
-  const rel='{relative_js}'; const pathname=window.location.pathname; let base=''; let notebookPath='';
-  const markers=['/lab/tree/','/tree/','/notebooks/'];
-  for(const marker of markers){{if(pathname.includes(marker)){{const parts=pathname.split(marker);base=parts[0];notebookPath=decodeURIComponent(parts.slice(1).join(marker));break;}}}}
-  const notebookDir=notebookPath.includes('/')?notebookPath.split('/').slice(0,-1).join('/'):'';
-  let target;
-  if(notebookDir.endsWith('TFM_ProcesadoDeAudios')) target=notebookDir+'/'+rel;
-  else if(notebookDir.includes('TFM_ProcesadoDeAudios/')) target=notebookDir.split('TFM_ProcesadoDeAudios/')[0]+'TFM_ProcesadoDeAudios/'+rel;
-  else target=(notebookDir?notebookDir+'/':'')+rel;
-  const encoded=target.split('/').filter(Boolean).map(encodeURIComponent).join('/');
-  const url=base+'/files/'+encoded+'?v={cache}';
-  const frame=document.getElementById('{iframe_id}'); const button=document.getElementById('{open_id}');
-  if(frame) frame.src=url; if(button) button.addEventListener('click',()=>window.open(url,'_blank'));
-}})();
+(function(){
+  const root = document.getElementById('tfm-dash');
+  let corpus = 'Todos', phase = '00';
+  function apply(){
+    root.querySelectorAll('.tfm-corpus').forEach(el=>{
+      el.style.display = (el.dataset.corpus===corpus) ? 'block' : 'none';
+      el.querySelectorAll('.tfm-panel').forEach(p=>{
+        p.style.display = (p.dataset.phase===phase) ? 'block' : 'none';
+      });
+    });
+    root.querySelectorAll('.tfm-tab').forEach(t=>{
+      t.style.background = (t.dataset.phase===phase) ? '#2A9D6F' : '#EEF3F1';
+      t.style.color = (t.dataset.phase===phase) ? 'white' : '#33484F';
+    });
+  }
+  root.querySelectorAll('.tfm-tab').forEach(t=>t.addEventListener('click',()=>{phase=t.dataset.phase;apply();}));
+  const sel = document.getElementById('tfm-corpus-filter');
+  if(sel) sel.addEventListener('change',()=>{corpus=sel.value;apply();});
+  apply();
+})();
 </script>
 """
+
+    return (
+        "<div id='tfm-dash' style='font-family:-apple-system,Segoe UI,Roboto,sans-serif;color:#123047;"
+        "background:#FFFFFF;border:1px solid #DDE5EA;border-radius:16px;padding:26px 30px;max-width:920px;'>"
+        "<div style='display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px;'>"
+        "<div style='font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#2A9D8F;'>Dashboard global de resultados · TFM</div>"
+        f"<div style='font-size:11px;color:#7A8288;'>{n_avail}/{n_total} outputs · {generated}</div>"
+        "</div>"
+        "<h1 style='margin:8px 0 14px;font-size:28px;font-weight:800;'>Resultados por fase del pipeline</h1>"
+        "<div style='display:flex;align-items:center;gap:10px;margin-bottom:14px;'>"
+        "<label style='font-size:13px;color:#456257;font-weight:600;'>Corpus:</label>"
+        f"<select id='tfm-corpus-filter' style='padding:6px 10px;border:1px solid #CFE8DD;border-radius:8px;font-size:13px;color:#123047;background:#F4FBF7;'>{corpus_options}</select>"
+        "</div>"
+        f"<div style='display:flex;flex-wrap:wrap;gap:6px;margin-bottom:18px;'>{tabs}</div>"
+        f"{corpus_versions}"
+        "</div>"
+        f"{script}"
+    ).replace(
+        "class='tfm-tab'",
+        "class='tfm-tab' style='border:0;border-radius:8px;padding:8px 12px;font-size:12.5px;font-weight:600;cursor:pointer;background:#EEF3F1;color:#33484F;'"
+    )
 
 
 # ============================================================
 # FUNCIÓN PÚBLICA
 # ============================================================
 
-
 def run_dashboard_resultados_globales(
-    gcs_client: Any,
-    force_restore: bool = False,
-    save_html_snapshot: bool = False,
-) -> HTML:
-    """Restaura outputs desde GCS y genera un dashboard HTML autónomo.
-
-    Las pestañas, los filtros y la descarga del HTML funcionan con JavaScript
-    dentro del archivo generado. Después de la carga inicial no requieren que el
-    kernel permanezca activo. El argumento ``save_html_snapshot`` se conserva por
-    compatibilidad; el HTML se guarda siempre porque forma parte de la demo.
-
-    Esta función no sube, elimina ni modifica objetos en Google Cloud Storage.
+    gcs_client=None, force_restore: bool = False, save_html_snapshot: bool = False,
+):
     """
-    if gcs_client is None:
-        raise ValueError("gcs_client no puede ser None.")
+    Genera el dashboard global de resultados (versión ligera) y lo devuelve
+    como HTML para mostrar en el notebook.
 
+    Pestañas por fase (00–09), cada una con sus métricas finales agregadas y un
+    gráfico representativo. Filtro simple de corpus (Todos / Bajas / Comerciales).
+    Solo lee outputs; nunca sube ni modifica nada en GCS.
+    """
     global _GCS_CLIENT
     _GCS_CLIENT = gcs_client
 
-    availability = _restore_dashboard_inputs(force=force_restore)
-    datasets = _prepare_datasets(_load_datasets())
-    payload = _build_dashboard_payload(datasets, availability)
+    availability = _restore_inputs(force=force_restore)
+    datasets = _load_datasets()
 
-    HTML_DIR.mkdir(parents=True, exist_ok=True)
-    HTML_PATH.write_text(_build_full_html(payload), encoding="utf-8")
+    aggregates_by_corpus = {
+        corpus: compute_phase_aggregates(datasets, corpus)
+        for corpus in ["Todos", "Bajas", "Comerciales"]
+    }
+    html = build_html(aggregates_by_corpus, availability)
 
-    available_count = int(availability["available"].sum())
-    total_count = len(availability)
-    loaded_rows = sum(len(df) for df in datasets.values())
+    n_avail = int(availability["available"].sum()) if not availability.empty else 0
+    print(f"Outputs disponibles: {n_avail}/{len(availability)}")
+    print("Subidas a GCS: deshabilitadas (esta fase solo lee).")
 
-    print("PROJECT_DIR:", PROJECT_DIR)
-    print("GCS configurado:", True)
-    print("Datasets disponibles:", f"{available_count}/{total_count}")
-    print("Filas cargadas en total:", f"{loaded_rows:,}".replace(",", "."))
-    print("Subidas a GCS:", "deshabilitadas")
-    print("HTML local:", HTML_PATH)
-    print("Interacción:", "pestañas y filtros independientes del kernel")
+    if save_html_snapshot:
+        DASHBOARD_DIR.mkdir(parents=True, exist_ok=True)
+        HTML_DIR.mkdir(parents=True, exist_ok=True)
+        full = (
+            "<!DOCTYPE html><html lang='es'><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+            "<title>Dashboard global de resultados · TFM</title></head>"
+            f"<body style='margin:0;padding:20px;background:#EEF3F1;'>{html}</body></html>"
+        )
+        HTML_PATH.write_text(full, encoding="utf-8")
+        size_kb = HTML_PATH.stat().st_size / 1024
+        print(f"HTML guardado: {HTML_PATH} ({size_kb:.0f} KB)")
 
-    return HTML(_jupyter_iframe_fragment(HTML_PATH))
+    return HTML(html)
